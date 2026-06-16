@@ -164,25 +164,26 @@ def test_world_model_update(config):
 def test_dreaming(config):
     ac = ActorCritic(config.state_dim, config.action_dim, config.hidden)
     wm = WorldModel(config.state_dim, config.action_dim, config.wm_hidden)
-    state = np.random.randn(config.state_dim).astype(np.float32)
-    action, raw_action, log_prob, value = select_action_with_dreaming(
+    state = torch.randn(config.state_dim)
+    action, raw_action, log_prob, value, scores = select_action_with_dreaming(
         ac, wm, state, k=config.dream_k,
         w_progress=config.w_progress, w_risk=config.w_risk, w_value=config.w_value,
     )
     assert action.shape == (config.action_dim,), action.shape
     assert raw_action.shape == (config.action_dim,)
-    assert np.isscalar(log_prob) and np.isscalar(value)
-    ok("select_action_with_dreaming", f"action shape {action.shape}")
+    assert len(scores) == config.dream_k
+    ok("select_action_with_dreaming", f"action shape {tuple(action.shape)}")
 
 
 def test_training_loop(config):
-    # Small rollout so 3 episodes run quickly.
+    # Small rollout so 3 episodes run quickly; no eval/checkpoint side effects.
     small = Config()
     small.rollout_size = 256
     small.update_epochs = 2
     small.batch_size = 64
     small.max_episode_steps = 50
-    history = train(small, mock=True, num_episodes=3, verbose=False)
+    history = train(small, mock=True, num_episodes=3, verbose=False,
+                    eval_interval=0, ckpt_dir=None)
     assert len(history) == 3
     for h in history:
         assert np.isscalar(h["return"])
@@ -228,6 +229,29 @@ def test_world_model_trainer(config):
     ok("world_model_trainer", "loss decreased over 5 updates")
 
 
+def test_dreamer_ppo_full(config):
+    import shutil
+    import tempfile
+    ckpt = tempfile.mkdtemp(prefix="dppo_ckpt_")
+    try:
+        small = Config()
+        small.rollout_size = 256
+        small.update_epochs = 2
+        small.batch_size = 64
+        small.max_episode_steps = 50
+        small.wm_warmup_steps = 0          # dreaming gates ON from episode 0
+        history = train(small, mock=True, num_episodes=3, verbose=False,
+                        eval_interval=0, ckpt_dir=ckpt)
+        assert len(history) == 3
+        assert sum(h["dreaming_steps"] for h in history) > 0
+        assert all(h["dreaming_active"] == 1 for h in history)
+        assert os.path.isdir(ckpt)
+        assert any(f.endswith(".pt") for f in os.listdir(ckpt))
+    finally:
+        shutil.rmtree(ckpt, ignore_errors=True)
+    ok("dreamer_ppo_full", "3 episodes, dreaming gates correctly")
+
+
 def main():
     config = Config()
     print("Running Dreamer-PPO mock pipeline tests (no CARLA needed)...\n")
@@ -243,6 +267,7 @@ def main():
     test_ppo_baseline(config)
     test_vru_rewards(config)
     test_world_model_trainer(config)
+    test_dreamer_ppo_full(config)
     print("\n✅ ALL TESTS PASSED")
 
 

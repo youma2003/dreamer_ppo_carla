@@ -3,10 +3,13 @@
 Usage:
     python plot_results.py --log logs/training_log.csv
 
-Produces three PNGs in logs/plots/:
+Produces PNGs in logs/plots/:
     return.png            episode return (raw + smoothed, window=10)
     vru_collisions.png    VRU collisions per episode
     ppo_loss.png          PPO loss over time
+    vru_risk.png          VRU risk reward over time      (if column present)
+    progress.png          progress reward over time      (if column present)
+    collision_rate.png    collision rate over time       (if column present)
 """
 import argparse
 import csv
@@ -100,6 +103,21 @@ def main():
         "PPO loss over time", "Loss",
         os.path.join(out_dir, "ppo_loss.png"),
     )
+
+    # Optional reward-component plots (present in newer CSV logs).
+    optional = [
+        ("r_vru", "VRU risk reward over time", "VRU risk reward", "vru_risk.png"),
+        ("r_progress", "Progress reward over time", "Progress reward", "progress.png"),
+        ("vru_collisions", "Collision rate over time", "Collisions / episode",
+         "collision_rate.png"),
+    ]
+    for column, title, ylabel, fname in optional:
+        if column in data:
+            _line_plot(
+                episodes,
+                [(column, data[column], "-")],
+                title, ylabel, os.path.join(out_dir, fname),
+            )
 
     print(f"\nDone. Plots written to {out_dir}/")
 

@@ -29,6 +29,11 @@ from training.ppo import update_ppo, update_world_model
 from training.dreamer_ppo import select_action_with_dreaming, train
 from training.ppo_baseline import train_baseline
 
+# tests/ dir on path so the standalone reward suite is importable.
+if os.path.dirname(__file__) not in sys.path:
+    sys.path.insert(0, os.path.dirname(__file__))
+from test_rewards import run_all as run_reward_scenarios
+
 
 def ok(name, result=""):
     print(f"✅ {name} : {result}")
@@ -200,6 +205,12 @@ def test_ppo_baseline(config):
     ok("ppo_baseline", "3 episodes completed")
 
 
+def test_vru_rewards(config):
+    n = run_reward_scenarios(verbose=False)
+    assert n == 6
+    ok("vru_rewards", "all 6 scenarios passed")
+
+
 def main():
     config = Config()
     print("Running Dreamer-PPO mock pipeline tests (no CARLA needed)...\n")
@@ -213,6 +224,7 @@ def main():
     test_dreaming(config)
     test_training_loop(config)
     test_ppo_baseline(config)
+    test_vru_rewards(config)
     print("\n✅ ALL TESTS PASSED")
 
 

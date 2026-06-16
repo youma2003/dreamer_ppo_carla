@@ -7,12 +7,15 @@ class Logger:
     """Append-style CSV logger.
 
     Writes one row per episode to ``<log_dir>/<filename>`` with the columns:
-        episode, return, ppo_loss, vf_loss, entropy,
+        episode, return, r_progress, r_vru, r_collision, r_comfort, r_rules,
+        ppo_loss, vf_loss, entropy,
         vru_collisions, lane_departures, route_completion
     """
 
     FIELDS = [
-        "episode", "return", "ppo_loss", "vf_loss", "entropy",
+        "episode", "return",
+        "r_progress", "r_vru", "r_collision", "r_comfort", "r_rules",
+        "ppo_loss", "vf_loss", "entropy",
         "vru_collisions", "lane_departures", "route_completion",
     ]
 

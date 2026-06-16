@@ -89,6 +89,8 @@ def train(config=None, mock=False, num_episodes=None, verbose=True,
             ep_return = 0.0
             ep_collisions = 0
             ep_lane_departures = 0
+            ep_components = {k: 0.0 for k in
+                             ("progress", "vru_risk", "collision", "comfort", "rules")}
             route_completion = float(obs[ROUTE_PROGRESS])
             done = False
 
@@ -109,6 +111,9 @@ def train(config=None, mock=False, num_episodes=None, verbose=True,
                 ep_return += reward
                 ep_collisions += int(bool(info.get("collision", False)))
                 ep_lane_departures += int(bool(info.get("lane_departure", False)))
+                comp = info.get("reward_components", {})
+                for key in ep_components:
+                    ep_components[key] += float(comp.get(key, 0.0))
                 route_completion = float(next_obs[ROUTE_PROGRESS])
                 obs = next_obs
 
@@ -145,6 +150,11 @@ def train(config=None, mock=False, num_episodes=None, verbose=True,
             record = {
                 "episode": episode,
                 "return": ep_return,
+                "r_progress": ep_components["progress"],
+                "r_vru": ep_components["vru_risk"],
+                "r_collision": ep_components["collision"],
+                "r_comfort": ep_components["comfort"],
+                "r_rules": ep_components["rules"],
                 "ppo_loss": last_ppo.get("loss", 0.0),
                 "vf_loss": last_ppo.get("value_loss", 0.0),
                 "entropy": last_ppo.get("entropy", 0.0),

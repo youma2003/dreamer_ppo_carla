@@ -46,6 +46,6 @@ class Config:
     sigma_d: float = 5.0
     lambda_ttc: float = 0.5
     tau_ttc: float = 2.0
-    lambda_cross: float = 0.5
+    lambda_cross: float = 1.0
     eta1: float = 0.5  # lane departure weight in safety term
     eta2: float = 0.3  # general risk weight in safety term

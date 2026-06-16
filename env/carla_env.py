@@ -6,7 +6,9 @@ project can be developed and tested locally without CARLA installed.
 import numpy as np
 
 from configs.config import Config
-from rewards.vru_reward import compute_reward, compute_vru_risk_target, ROUTE_PROGRESS
+from rewards.vru_reward import (
+    compute_reward, compute_vru_risk_target, ROUTE_PROGRESS, LANE_OFFSET,
+)
 
 
 class CarlaEnv:
@@ -134,20 +136,27 @@ class CarlaEnv:
             s[base + 3:base + 5] = self.rng.uniform(-20, 20, size=2)
         return s
 
-    def _mock_info(self, state, action):
-        """Build an info dict with mock VRU + rule signals for the reward."""
-        collision = self.rng.random() < 0.02
+    def _mock_info(self, state, action, progress):
+        """Build a realistic info dict with mock VRU + rule signals."""
+        collision = bool(self.rng.random() < 0.05)        # 5% per step
+        lane_departure = bool(self.rng.random() < 0.10)   # 10% per step
         info = {
             "action": np.asarray(action, dtype=np.float32),
             "prev_action": self._prev_action.copy(),
-            "collision": bool(collision),
-            "lane_departure": bool(abs(state[6]) > 1.4),
-            "red_light": bool(state[10] == 0 and state[11] < 5 and state[2] > 1),
-            "stop_sign_violation": bool(self.rng.random() < 0.01),
-            "crosswalk_conflict": float(self.rng.random() < 0.05),
-            "general_risk": float(self.rng.uniform(0, 0.3)),
+            "collision": collision,
+            "lane_departure": lane_departure,
+            "red_light_violation": bool(self.rng.random() < 0.03),   # 3%
+            "stop_sign_violation": bool(self.rng.random() < 0.02),   # 2%
+            "crosswalk_conflict": bool(self.rng.random() < 0.05),    # 5%
+            "general_risk": float(self.rng.uniform(0.0, 0.3)),
+            # `progress` is the real per-step route advance (used as the
+            # world-model progress target); it stays consistent with the
+            # reward instead of being pure noise.
+            "progress": float(progress),
+            "route_completion": float(state[ROUTE_PROGRESS]),
+            "vru_collisions": int(collision),
+            "lane_departures": int(lane_departure),
         }
-        info["progress"] = float(self.rng.uniform(-0.02, 0.05))
         info["vru_risk"] = compute_vru_risk_target(state, info, self.config)
         return info
 
@@ -174,18 +183,22 @@ class CarlaEnv:
 
         if self.mock:
             next_state = self._random_state()
-            # carry over route progress monotonically for realism
-            info = self._mock_info(next_state, action)
+            # Advance route progress monotonically for realism.
+            progress = float(self.rng.uniform(0.0, 0.05))
             next_state[ROUTE_PROGRESS] = np.clip(
-                self._state[ROUTE_PROGRESS] + info["progress"], 0.0, 1.0
+                self._state[ROUTE_PROGRESS] + progress, 0.0, 1.0
             )
-            reward = compute_reward(self._state, next_state, info, self.config)
+            info = self._mock_info(next_state, action, progress)
+            reward, components = compute_reward(
+                self._state, next_state, action, self._prev_action,
+                info, self.config,
+            )
+            info["reward_components"] = components
             self._step_count += 1
             done = bool(
                 info["collision"]
                 or next_state[ROUTE_PROGRESS] >= 1.0
                 or self._step_count >= self.config.max_episode_steps
-                or self.rng.random() < 0.01
             )
             self._prev_action = action.copy()
             self._state = next_state
@@ -196,7 +209,11 @@ class CarlaEnv:
         self.world.tick()
         next_state = self._observe()
         info = self._real_info(next_state, action)
-        reward = compute_reward(self._state, next_state, info, self.config)
+        reward, components = compute_reward(
+            self._state, next_state, action, self._prev_action,
+            info, self.config,
+        )
+        info["reward_components"] = components
         self._step_count += 1
         done = bool(
             self._collision_flag
@@ -238,16 +255,21 @@ class CarlaEnv:
         return s
 
     def _real_info(self, state, action):  # pragma: no cover - requires CARLA
+        collision = bool(self._collision_flag)
+        lane_departure = bool(abs(state[LANE_OFFSET]) > 1.4)
         info = {
             "action": np.asarray(action, dtype=np.float32),
             "prev_action": self._prev_action.copy(),
-            "collision": bool(self._collision_flag),
-            "lane_departure": bool(abs(state[6]) > 1.4),
-            "red_light": False,
+            "collision": collision,
+            "lane_departure": lane_departure,
+            "red_light_violation": False,
             "stop_sign_violation": False,
-            "crosswalk_conflict": 0.0,
+            "crosswalk_conflict": False,
             "general_risk": 0.0,
             "progress": float(state[ROUTE_PROGRESS] - self._state[ROUTE_PROGRESS]),
+            "route_completion": float(state[ROUTE_PROGRESS]),
+            "vru_collisions": int(collision),
+            "lane_departures": int(lane_departure),
         }
         info["vru_risk"] = compute_vru_risk_target(state, info, self.config)
         return info

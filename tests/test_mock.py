@@ -27,6 +27,7 @@ from models.rssm import RSSM
 from training.rollout_buffer import RolloutBuffer
 from training.ppo import update_ppo, update_world_model
 from training.dreamer_ppo import select_action_with_dreaming, train
+from training.ppo_baseline import train_baseline
 
 
 def ok(name, result=""):
@@ -183,6 +184,22 @@ def test_training_loop(config):
        f"{[round(h['return'], 1) for h in history]}")
 
 
+def test_ppo_baseline(config):
+    # Small rollout so 3 episodes run quickly; no logging side effects.
+    small = Config()
+    small.rollout_size = 256
+    small.update_epochs = 2
+    small.batch_size = 64
+    small.max_episode_steps = 50
+    history = train_baseline(small, mock=True, num_episodes=3, verbose=False,
+                             log_dir=None)
+    assert len(history) == 3
+    for h in history:
+        assert np.isscalar(h["return"])
+        assert "vru_collisions" in h and "ppo_loss" in h
+    ok("ppo_baseline", "3 episodes completed")
+
+
 def main():
     config = Config()
     print("Running Dreamer-PPO mock pipeline tests (no CARLA needed)...\n")
@@ -195,6 +212,7 @@ def main():
     test_world_model_update(config)
     test_dreaming(config)
     test_training_loop(config)
+    test_ppo_baseline(config)
     print("\n✅ ALL TESTS PASSED")
 
 

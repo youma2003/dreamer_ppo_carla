@@ -9,8 +9,10 @@ from env.carla_env import CarlaEnv
 from models.actor_critic import ActorCritic
 from models.world_model import WorldModel
 from training.rollout_buffer import RolloutBuffer
-from training.ppo import update_ppo, update_world_model
+from training.ppo import update_ppo
 from training.logger import Logger
+from training.wm_buffer import WorldModelBuffer
+from training.world_model_trainer import WorldModelTrainer
 from rewards.vru_reward import ROUTE_PROGRESS
 
 
@@ -73,12 +75,15 @@ def train(config=None, mock=False, num_episodes=None, verbose=True,
     world_model = WorldModel(config.state_dim, config.action_dim, config.wm_hidden)
 
     opt_pi = torch.optim.Adam(policy.parameters(), lr=config.lr_policy)
-    opt_wm = torch.optim.Adam(world_model.parameters(), lr=config.lr_wm)
 
     buffer = RolloutBuffer(
         config.rollout_size, config.state_dim, config.action_dim,
         gamma=config.gamma, lam=config.lam,
     )
+    # Long-lived replay + dedicated trainer for the world model.
+    wm_buffer = WorldModelBuffer(capacity=50_000, state_dim=config.state_dim,
+                                 action_dim=config.action_dim)
+    wm_trainer = WorldModelTrainer(world_model, config)
 
     logger = Logger(log_dir) if log_dir else None
     history = []
@@ -108,6 +113,9 @@ def train(config=None, mock=False, num_episodes=None, verbose=True,
 
                 buffer.store(obs, raw_action, reward, done, value, log_prob,
                              next_obs, risk_target, progress_target)
+                # Feed the long-lived world-model replay (bounded action, the
+                # same representation used when dreaming).
+                wm_buffer.add(obs, action, next_obs, risk_target, progress_target)
                 ep_return += reward
                 ep_collisions += int(bool(info.get("collision", False)))
                 ep_lane_departures += int(bool(info.get("lane_departure", False)))
@@ -129,10 +137,10 @@ def train(config=None, mock=False, num_episodes=None, verbose=True,
                     )
                 buffer.finish_path(last_value=float(last_v.item()))
 
-            # ---- updates ---- #
+            # ---- PPO update ---- #
             batch = buffer.get()
             n = batch["states"].shape[0]
-            last_ppo, last_wm = {}, {}
+            last_ppo = {}
             for _ in range(config.update_epochs):
                 idx = np.random.permutation(n)
                 for start in range(0, n, config.batch_size):
@@ -143,9 +151,16 @@ def train(config=None, mock=False, num_episodes=None, verbose=True,
                         ent_coef=config.ent_coef, vf_coef=config.vf_coef,
                         max_grad_norm=config.max_grad_norm,
                     )
-                    last_wm = update_world_model(
-                        world_model, opt_wm, mb, max_grad_norm=config.max_grad_norm
-                    )
+
+            # ---- world-model update (from its own replay) ---- #
+            wm_stats, wm_eval = {}, {}
+            if wm_buffer.is_ready(min_size=1000):
+                wm_batch = wm_buffer.sample(config.wm_batch_size)
+                wm_stats = wm_trainer.update(wm_batch)
+                wm_eval = wm_trainer.evaluate(wm_batch)
+                if verbose and episode % 10 == 0:
+                    print(f"  WM eval: state_err={wm_eval['state_pred_error']:.4f} "
+                          f"risk_err={wm_eval['risk_pred_error']:.4f}")
 
             record = {
                 "episode": episode,
@@ -158,7 +173,9 @@ def train(config=None, mock=False, num_episodes=None, verbose=True,
                 "ppo_loss": last_ppo.get("loss", 0.0),
                 "vf_loss": last_ppo.get("value_loss", 0.0),
                 "entropy": last_ppo.get("entropy", 0.0),
-                "wm_loss": last_wm.get("loss", 0.0),
+                "loss_wm": wm_stats.get("loss_wm", 0.0),
+                "wm_state_err": wm_eval.get("state_pred_error", 0.0),
+                "wm_risk_err": wm_eval.get("risk_pred_error", 0.0),
                 "vru_collisions": ep_collisions,
                 "lane_departures": ep_lane_departures,
                 "route_completion": route_completion,
@@ -171,7 +188,7 @@ def train(config=None, mock=False, num_episodes=None, verbose=True,
                 print(
                     f"[ep {episode:4d}] return={ep_return:8.2f} "
                     f"ppo_loss={last_ppo.get('loss', 0.0):7.4f} "
-                    f"wm_loss={last_wm.get('loss', 0.0):7.4f} "
+                    f"loss_wm={wm_stats.get('loss_wm', 0.0):7.4f} "
                     f"collisions={ep_collisions}"
                 )
     finally:

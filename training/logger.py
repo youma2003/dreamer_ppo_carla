@@ -8,7 +8,7 @@ class Logger:
 
     Writes one row per episode to ``<log_dir>/<filename>`` with the columns:
         episode, return, r_progress, r_vru, r_collision, r_comfort, r_rules,
-        ppo_loss, vf_loss, entropy,
+        ppo_loss, vf_loss, entropy, loss_wm, wm_state_err, wm_risk_err,
         vru_collisions, lane_departures, route_completion
     """
 
@@ -16,6 +16,7 @@ class Logger:
         "episode", "return",
         "r_progress", "r_vru", "r_collision", "r_comfort", "r_rules",
         "ppo_loss", "vf_loss", "entropy",
+        "loss_wm", "wm_state_err", "wm_risk_err",
         "vru_collisions", "lane_departures", "route_completion",
     ]
 

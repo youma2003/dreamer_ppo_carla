@@ -28,6 +28,7 @@ from training.rollout_buffer import RolloutBuffer
 from training.ppo import update_ppo, update_world_model
 from training.dreamer_ppo import select_action_with_dreaming, train
 from training.ppo_baseline import train_baseline
+from training.world_model_trainer import WorldModelTrainer
 
 # tests/ dir on path so the standalone reward suite is importable.
 if os.path.dirname(__file__) not in sys.path:
@@ -211,6 +212,22 @@ def test_vru_rewards(config):
     ok("vru_rewards", "all 6 scenarios passed")
 
 
+def test_world_model_trainer(config):
+    wm = WorldModel(config.state_dim, config.action_dim, config.wm_hidden)
+    trainer = WorldModelTrainer(wm, config)
+    # A fixed batch: repeated updates should drive the loss down.
+    batch = {
+        "states": torch.randn(256, config.state_dim),
+        "actions": torch.randn(256, config.action_dim),
+        "next_states": torch.randn(256, config.state_dim),
+        "risk_targets": torch.rand(256),
+        "progress_targets": torch.randn(256),
+    }
+    losses = [trainer.update(batch)["loss_wm"] for _ in range(5)]
+    assert losses[-1] < losses[0], losses
+    ok("world_model_trainer", "loss decreased over 5 updates")
+
+
 def main():
     config = Config()
     print("Running Dreamer-PPO mock pipeline tests (no CARLA needed)...\n")
@@ -225,6 +242,7 @@ def main():
     test_training_loop(config)
     test_ppo_baseline(config)
     test_vru_rewards(config)
+    test_world_model_trainer(config)
     print("\n✅ ALL TESTS PASSED")
 
 

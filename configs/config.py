@@ -16,6 +16,8 @@ class Config:
     # World model
     wm_hidden: int = 256
     lr_wm: float = 3e-4
+    wm_batch_size: int = 256
+    wm_warmup_steps: int = 1000   # transitions trained before dreaming starts
 
     # PPO
     hidden: int = 256

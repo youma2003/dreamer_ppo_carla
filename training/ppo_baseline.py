@@ -1,9 +1,12 @@
-"""Step 2 baseline: plain PPO with NO world model and NO dreaming.
+"""Step 2 baseline: plain PPO with NO dreaming.
 
 Same training structure as ``dreamer_ppo.py`` but the action is taken
 directly from the policy (``policy.act``) — no candidate sampling, no
-imagined rollouts — and there is no world-model update step. Use this as
-the reference point that the full Dreamer-PPO agent is compared against.
+imagined rollouts. The policy is *never* conditioned on the world model.
+
+The world model is still trained in the background from the collected
+transitions (Step 4), so that by the time dreaming is enabled it is already
+well-trained — but it does not influence the baseline policy in any way.
 """
 import argparse
 
@@ -13,9 +16,12 @@ import torch
 from configs.config import Config
 from env.carla_env import CarlaEnv
 from models.actor_critic import ActorCritic
+from models.world_model import WorldModel
 from training.rollout_buffer import RolloutBuffer
 from training.ppo import update_ppo
 from training.logger import Logger
+from training.wm_buffer import WorldModelBuffer
+from training.world_model_trainer import WorldModelTrainer
 from rewards.vru_reward import ROUTE_PROGRESS
 
 
@@ -60,6 +66,11 @@ def train_baseline(config=None, mock=False, num_episodes=None, verbose=True,
         config.rollout_size, config.state_dim, config.action_dim,
         gamma=config.gamma, lam=config.lam,
     )
+    # World model trained in the background (does not affect the policy).
+    world_model = WorldModel(config.state_dim, config.action_dim, config.wm_hidden)
+    wm_buffer = WorldModelBuffer(capacity=50_000, state_dim=config.state_dim,
+                                 action_dim=config.action_dim)
+    wm_trainer = WorldModelTrainer(world_model, config)
 
     logger = Logger(log_dir) if log_dir else None
     history = []
@@ -85,6 +96,7 @@ def train_baseline(config=None, mock=False, num_episodes=None, verbose=True,
 
                 buffer.store(obs, raw_action, reward, done, value, log_prob,
                              next_obs, risk_target, progress_target)
+                wm_buffer.add(obs, action, next_obs, risk_target, progress_target)
                 ep_return += reward
                 ep_collisions += int(bool(info.get("collision", False)))
                 ep_lane_departures += int(bool(info.get("lane_departure", False)))
@@ -106,7 +118,7 @@ def train_baseline(config=None, mock=False, num_episodes=None, verbose=True,
                     )
                 buffer.finish_path(last_value=float(last_v.item()))
 
-            # ---- PPO update only (no world-model update) ---- #
+            # ---- PPO update (policy only) ---- #
             batch = buffer.get()
             n = batch["states"].shape[0]
             stats = {}
@@ -121,6 +133,16 @@ def train_baseline(config=None, mock=False, num_episodes=None, verbose=True,
                         max_grad_norm=config.max_grad_norm,
                     )
 
+            # ---- background world-model update (does not affect policy) ---- #
+            wm_stats, wm_eval = {}, {}
+            if wm_buffer.is_ready(min_size=1000):
+                wm_batch = wm_buffer.sample(config.wm_batch_size)
+                wm_stats = wm_trainer.update(wm_batch)
+                wm_eval = wm_trainer.evaluate(wm_batch)
+                if verbose and episode % 10 == 0:
+                    print(f"  WM eval: state_err={wm_eval['state_pred_error']:.4f} "
+                          f"risk_err={wm_eval['risk_pred_error']:.4f}")
+
             record = {
                 "episode": episode,
                 "return": ep_return,
@@ -132,6 +154,9 @@ def train_baseline(config=None, mock=False, num_episodes=None, verbose=True,
                 "ppo_loss": stats.get("loss", 0.0),
                 "vf_loss": stats.get("value_loss", 0.0),
                 "entropy": stats.get("entropy", 0.0),
+                "loss_wm": wm_stats.get("loss_wm", 0.0),
+                "wm_state_err": wm_eval.get("state_pred_error", 0.0),
+                "wm_risk_err": wm_eval.get("risk_pred_error", 0.0),
                 "vru_collisions": ep_collisions,
                 "lane_departures": ep_lane_departures,
                 "route_completion": route_completion,

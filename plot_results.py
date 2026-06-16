@@ -110,6 +110,11 @@ def main():
         ("r_progress", "Progress reward over time", "Progress reward", "progress.png"),
         ("vru_collisions", "Collision rate over time", "Collisions / episode",
          "collision_rate.png"),
+        ("loss_wm", "World model loss over episodes", "WM total loss", "wm_loss.png"),
+        ("wm_state_err", "State prediction error over episodes",
+         "State MAE", "wm_state_err.png"),
+        ("wm_risk_err", "Risk prediction error over episodes",
+         "Risk MAE", "wm_risk_err.png"),
     ]
     for column, title, ylabel, fname in optional:
         if column in data:

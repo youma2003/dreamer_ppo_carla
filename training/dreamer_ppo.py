@@ -287,6 +287,258 @@ def train(config=None, mock=False, num_episodes=None, verbose=True, log_dir=None
     return history
 
 
+# ---------------------------------------------------------------------- #
+# S-DBS training (Serendipitous Diverse Beam Search extension)
+# ---------------------------------------------------------------------- #
+def _build_occupancy_targets(states, grid=16, extent=20.0):
+    """Rasterize nearest-vehicle + VRU relative positions into a BEV occupancy
+    grid target (B, grid, grid) for the scene-reconstruction head.
+
+    Relative-position pairs in the state vector: nearest vehicle (16, 17),
+    VRU0 (21, 22), VRU1 (26, 27).
+    """
+    states = states.detach().cpu().numpy()
+    b = states.shape[0]
+    target = np.zeros((b, grid, grid), dtype=np.float32)
+    pairs = [(16, 17), (21, 22), (26, 27)]
+    for i in range(b):
+        for xi, yi in pairs:
+            rx, ry = float(states[i, xi]), float(states[i, yi])
+            gx = int((rx + extent) / (2 * extent) * grid)
+            gy = int((ry + extent) / (2 * extent) * grid)
+            if 0 <= gx < grid and 0 <= gy < grid:
+                target[i, gx, gy] = 1.0
+    return torch.as_tensor(target)
+
+
+def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
+               log_dir=None, device="cpu", ckpt_dir="checkpoints"):
+    """Dreamer-PPO with S-DBS planning, risk-aware curriculum, and grounding.
+
+    Replaces greedy one-step dreaming with multi-step diverse beam search,
+    trains a world-model ensemble + auxiliary heads alongside PPO, and draws
+    scenarios from a prioritized curriculum. Falls back to the base ``Config``
+    behaviour for everything not specific to S-DBS.
+    """
+    from configs.sdbs_config import SDBSConfig
+    from planning.sdbs_planner import SDBSPlanner
+    from planning.curriculum import RiskAwareCurriculum
+    from models.auxiliary_heads import (
+        SceneReconstructionHead, RiskDensityHead, WorldModelEnsemble,
+    )
+
+    config = config or SDBSConfig()
+    if num_episodes is not None:
+        config.num_episodes = num_episodes
+    device = torch.device(device)
+
+    env = CarlaEnv(mock=mock, config=config)
+    policy = ActorCritic(config.state_dim, config.action_dim, config.hidden).to(device)
+    world_model = WorldModel(config.state_dim, config.action_dim,
+                             config.wm_hidden).to(device)
+    optimizer_pi = torch.optim.Adam(policy.parameters(), lr=config.lr_policy)
+
+    buffer = RolloutBuffer(
+        config.rollout_size, config.state_dim, config.action_dim,
+        gamma=config.gamma, lam=config.lam,
+    )
+    wm_buffer = WorldModelBuffer(capacity=50_000, state_dim=config.state_dim,
+                                 action_dim=config.action_dim)
+    wm_trainer = WorldModelTrainer(world_model, config)
+
+    sdbs_planner = SDBSPlanner(policy, world_model, policy, config, device=device)
+    curriculum = RiskAwareCurriculum(config)
+    scenario_replayer = curriculum.replayer
+
+    world_model_ensemble = WorldModelEnsemble(
+        type(world_model), config.state_dim, config.action_dim,
+        n_models=config.world_model_ensemble_size, device=device,
+    )
+    wm_ensemble_opt = torch.optim.Adam(world_model_ensemble.parameters(),
+                                       lr=config.lr_wm)
+    recon_head = SceneReconstructionHead(config.hidden).to(device)
+    risk_density_head = RiskDensityHead(config.hidden).to(device)
+    aux_opt = torch.optim.Adam(
+        list(recon_head.parameters()) + list(risk_density_head.parameters()),
+        lr=config.lr_wm,
+    )
+
+    logger = Logger(log_dir) if log_dir else None
+    if ckpt_dir:
+        os.makedirs(ckpt_dir, exist_ok=True)
+    best_eval_return = -float("inf")
+    aux_ready = max(32, min(config.wm_batch_size, 64))
+
+    history = []
+    try:
+        for episode in range(config.num_episodes):
+            scenario_ids = curriculum.get_active_scenarios()
+            if len(scenario_ids) > config.max_scenarios_per_episode:
+                # Prioritized replay decides which scenarios to revisit.
+                scenario_ids = scenario_replayer.sample_scenarios(
+                    config.max_scenarios_per_episode
+                )
+
+            ep_return = 0.0
+            ep_collisions = 0
+            ep_planning_steps = 0
+            ep_completion = 0.0
+            last_meta = {"latency_ms": 0.0, "difficulty": 0.0}
+            ppo_stats, wm_stats = {}, {"loss_wm": 0.0}
+            aux_loss_val = 0.0
+            wm_ens_loss_val = 0.0
+
+            for scenario_id in scenario_ids:
+                buffer.clear()
+                obs = env.reset_to_scenario(scenario_id)
+                info = {}
+
+                while not buffer.is_full():
+                    state = torch.as_tensor(obs, dtype=torch.float32, device=device)
+                    best_action, plan, meta = sdbs_planner.plan(state, info)
+                    last_meta = meta
+                    ep_planning_steps += 1
+                    action_np = best_action.cpu().numpy()
+
+                    next_obs, reward, done, info = env.step(action_np)
+
+                    # Intrinsic reward from serendipitous discoveries.
+                    if meta.get("serendipity_bonus_used"):
+                        reward += config.eta_s * meta.get("serendipity_score", 0.0)
+
+                    risk_target = float(info.get("vru_risk", 0.0))
+                    progress_target = float(info.get("progress", 0.0))
+
+                    # Train PPO on the policy proposal behind the first action,
+                    # even when execution was overridden by a safety mandate.
+                    buffer.store(obs, meta["first_raw_action"], reward, done,
+                                 meta["first_value"], meta["first_log_prob"],
+                                 next_obs, risk_target, progress_target)
+                    wm_buffer.add(obs, action_np, next_obs,
+                                  risk_target, progress_target)
+
+                    ep_return += reward
+                    ep_collisions += int(info.get("vru_collisions", 0))
+                    ep_completion = float(next_obs[ROUTE_PROGRESS])
+                    obs = next_obs
+
+                    if done:
+                        buffer.finish_path(last_value=0.0)
+                        scenario_replayer.record_episode(
+                            scenario_id=scenario_id,
+                            n_collisions=int(info.get("vru_collisions", 0)),
+                            n_near_misses=int(info.get("near_misses", 0)),
+                            n_ttc_violations=int(info.get("ttc_violations", 0)),
+                            progress_deficit=max(
+                                0.0, config.goal_distance
+                                - float(info.get("route_completion", ep_completion))
+                            ),
+                        )
+                        curriculum.record_rollout(scenario_id, {
+                            "vru_collisions": int(info.get("vru_collisions", 0)),
+                            "near_misses": int(info.get("near_misses", 0)),
+                            "route_completion": ep_completion,
+                        })
+                        obs = env.reset_to_scenario(scenario_id)
+
+                if buffer.path_start < buffer.ptr:
+                    with torch.no_grad():
+                        _, _, last_v = policy.forward(
+                            torch.as_tensor(obs, dtype=torch.float32,
+                                            device=device).unsqueeze(0)
+                        )
+                    buffer.finish_path(last_value=float(last_v.item()))
+
+                # ---- PPO update ---- #
+                batch = buffer.get()
+                n = batch["states"].shape[0]
+                for _ in range(config.update_epochs):
+                    idx = np.random.permutation(n)
+                    for start in range(0, n, config.batch_size):
+                        mb_idx = idx[start:start + config.batch_size]
+                        mb = {key: val[mb_idx] for key, val in batch.items()}
+                        ppo_stats = update_ppo(
+                            policy, optimizer_pi, mb, clip_eps=config.clip_eps,
+                            ent_coef=config.ent_coef, vf_coef=config.vf_coef,
+                            max_grad_norm=config.max_grad_norm,
+                        )
+
+                # ---- world-model (single + ensemble) update ---- #
+                if wm_buffer.is_ready(min_size=aux_ready):
+                    wm_stats = wm_trainer.update(wm_buffer.sample(config.wm_batch_size))
+
+                    wm_batch = wm_buffer.sample(config.wm_batch_size)
+                    wm_ens_loss = world_model_ensemble.loss(wm_batch)
+                    wm_ensemble_opt.zero_grad()
+                    wm_ens_loss.backward()
+                    wm_ensemble_opt.step()
+                    wm_ens_loss_val = float(wm_ens_loss.item())
+
+                    # ---- auxiliary grounding heads ---- #
+                    feats = policy.trunk(wm_batch["states"].float().to(device)).detach()
+                    recon_logits = recon_head(feats)
+                    occ_target = _build_occupancy_targets(wm_batch["states"]).to(device)
+                    recon_loss = recon_head.loss(recon_logits, occ_target)
+
+                    risk_pred = risk_density_head(feats)
+                    risk_loss = risk_density_head.loss(
+                        risk_pred, wm_batch["risk_targets"]
+                    )
+
+                    aux_loss = (config.lambda_recon * recon_loss
+                                + config.lambda_risk_density * risk_loss)
+                    aux_opt.zero_grad()
+                    aux_loss.backward()
+                    aux_opt.step()
+                    aux_loss_val = float(aux_loss.item())
+
+                # ---- curriculum advancement ---- #
+                if curriculum.should_advance_stage():
+                    curriculum.advance_to_next_stage()
+                    if verbose:
+                        print(f"CURRICULUM: Advanced to stage "
+                              f"{curriculum.current_stage()}")
+
+            if verbose:
+                print(f"Episode {episode:04d} | stage={curriculum.current_stage()} | "
+                      f"return={ep_return:.2f} | difficulty={last_meta['difficulty']:.2f} "
+                      f"| planning_latency={last_meta['latency_ms']:.1f}ms | "
+                      f"vru_collisions={ep_collisions}")
+
+            record = {
+                "episode": episode,
+                "return": ep_return,
+                "ppo_loss": ppo_stats.get("loss", 0.0),
+                "vf_loss": ppo_stats.get("value_loss", 0.0),
+                "entropy": ppo_stats.get("entropy", 0.0),
+                "loss_wm": wm_stats.get("loss_wm", 0.0),
+                "loss_wm_ensemble": wm_ens_loss_val,
+                "aux_loss": aux_loss_val,
+                "dreaming_active": 1,
+                "dreaming_steps": ep_planning_steps,
+                "vru_collisions": ep_collisions,
+                "route_completion": ep_completion,
+                "stage": curriculum.current_stage(),
+                "difficulty": last_meta.get("difficulty", 0.0),
+                "planning_latency_ms": last_meta.get("latency_ms", 0.0),
+            }
+            history.append(record)
+            if logger is not None:
+                logger.log(episode, record)
+
+            if ckpt_dir and episode % 100 == 0:
+                _save_checkpoint(
+                    os.path.join(ckpt_dir, f"sdbs_episode_{episode:04d}.pt"),
+                    episode, policy, world_model, optimizer_pi, ep_return,
+                )
+    finally:
+        env.close()
+        if logger is not None:
+            logger.close()
+
+    return history
+
+
 def main():
     # Ensure UTF-8 stdout so the 💾 marker renders on Windows consoles (cp1252).
     try:
@@ -297,13 +549,20 @@ def main():
     parser = argparse.ArgumentParser(description="Dreamer-PPO for CARLA")
     parser.add_argument("--mock", action="store_true",
                         help="run without CARLA installed")
+    parser.add_argument("--sdbs", action="store_true",
+                        help="use the S-DBS planner + risk-aware curriculum")
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
 
-    config = Config()
-    train(config, mock=args.mock, num_episodes=args.episodes,
-          device=args.device, log_dir="logs", ckpt_dir="checkpoints")
+    if args.sdbs:
+        from configs.sdbs_config import SDBSConfig
+        train_sdbs(SDBSConfig(), mock=args.mock, num_episodes=args.episodes,
+                   device=args.device, log_dir="logs", ckpt_dir="checkpoints")
+    else:
+        config = Config()
+        train(config, mock=args.mock, num_episodes=args.episodes,
+              device=args.device, log_dir="logs", ckpt_dir="checkpoints")
 
 
 if __name__ == "__main__":

@@ -34,6 +34,7 @@ class CarlaEnv:
         self._step_count = 0
         self._state = None
         self._prev_action = np.zeros(self.action_dim, dtype=np.float32)
+        self._scenario_id = None        # set by reset_to_scenario (S-DBS curriculum)
 
         # CARLA handles (real mode only).
         self.client = None
@@ -177,6 +178,16 @@ class CarlaEnv:
             self.world.tick()
         self._state = self._observe()
         return self._state.copy()
+
+    def reset_to_scenario(self, scenario_id):
+        """Reset the episode under a named curriculum scenario.
+
+        In mock mode this just records the scenario id and resets normally; in
+        real mode a scenario would select the spawn/traffic configuration. The
+        S-DBS curriculum uses the id to track per-scenario success and priority.
+        """
+        self._scenario_id = scenario_id
+        return self.reset()
 
     def step(self, action):
         action = np.asarray(action, dtype=np.float32).reshape(-1)

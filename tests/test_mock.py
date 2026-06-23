@@ -252,6 +252,35 @@ def test_dreamer_ppo_full(config):
     ok("dreamer_ppo_full", "3 episodes, dreaming gates correctly")
 
 
+def test_full_sdbs_loop(config):
+    from configs.sdbs_config import SDBSConfig
+    from training.dreamer_ppo import train_sdbs
+    small = SDBSConfig()
+    small.rollout_size = 128
+    small.update_epochs = 1
+    small.batch_size = 64
+    small.max_episode_steps = 20
+    small.wm_warmup_steps = 0
+    small.wm_batch_size = 64
+    # Keep the search cheap so 2 episodes run fast.
+    small.beam_width_max = 6
+    small.horizon_max = 2
+    small.num_groups_max = 2
+    small.compute_budget = 30
+    small.scenarios_per_stage = 2
+    small.max_scenarios_per_episode = 2
+    history = train_sdbs(small, mock=True, num_episodes=2, verbose=False,
+                         log_dir=None, ckpt_dir=None)
+    assert len(history) == 2
+    for h in history:
+        assert np.isscalar(h["return"])
+        assert "stage" in h and h["stage"] >= 1               # curriculum tracking
+        assert h["dreaming_steps"] > 0                        # S-DBS planning ran
+        assert "aux_loss" in h and np.isscalar(h["aux_loss"]) # aux losses computed
+    assert any(h["aux_loss"] != 0.0 for h in history)         # heads actually trained
+    ok("full_sdbs_loop", "2 episodes with S-DBS complete")
+
+
 def main():
     config = Config()
     print("Running Dreamer-PPO mock pipeline tests (no CARLA needed)...\n")
@@ -268,6 +297,7 @@ def main():
     test_vru_rewards(config)
     test_world_model_trainer(config)
     test_dreamer_ppo_full(config)
+    test_full_sdbs_loop(config)
     print("\n✅ ALL TESTS PASSED")
 
 

@@ -10,7 +10,7 @@ python -m training.ppo_baseline --mock --episodes 1000   # PPO-only baseline
 python -m training.dreamer_ppo  --mock --episodes 1000   # greedy dreaming
 ```
 
-See `PROFESSOR_INSTRUCTIONS.md` for running against a real CARLA 0.9.15 server.
+For a real run, start a CARLA 0.9.15 server and drop the `--mock` flag.
 
 ## S-DBS Extension (Advanced)
 

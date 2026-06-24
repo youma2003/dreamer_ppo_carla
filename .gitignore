@@ -9,6 +9,8 @@ env_local/
 runs/
 logs/
 checkpoints/
+data/trajectories.pkl
+data/prediction_checkpoints/
 .DS_Store
 .idea/
 .vscode/

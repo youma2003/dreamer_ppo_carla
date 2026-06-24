@@ -326,6 +326,8 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
     from models.auxiliary_heads import (
         SceneReconstructionHead, RiskDensityHead, WorldModelEnsemble,
     )
+    from models.traffic_predictor import TrafficPredictor
+    from training.traffic_prediction_trainer import TrafficPredictionTrainer
 
     config = config or SDBSConfig()
     if num_episodes is not None:
@@ -346,7 +348,21 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
                                  action_dim=config.action_dim)
     wm_trainer = WorldModelTrainer(world_model, config)
 
-    sdbs_planner = SDBSPlanner(policy, world_model, policy, config, device=device)
+    # Traffic / pedestrian trajectory predictor (agents are no longer static).
+    traffic_predictor = TrafficPredictor(
+        config.state_dim, horizon=config.predict_horizon,
+        hidden_dim=config.tp_hidden_dim, device=device)
+    tp_trainer = TrafficPredictionTrainer(traffic_predictor, config, device=device)
+    if config.collect_prediction_data:
+        if verbose:
+            print("Collecting trajectory data for prediction training...")
+        tp_trainer.collect_trajectories(
+            env, num_episodes=config.tp_collect_episodes)
+        if verbose:
+            print(f"Collected {len(tp_trainer.trajectory_buffer)} trajectories")
+
+    sdbs_planner = SDBSPlanner(policy, world_model, policy, config,
+                               traffic_predictor=traffic_predictor, device=device)
     curriculum = RiskAwareCurriculum(config)
     scenario_replayer = curriculum.replayer
 
@@ -383,10 +399,11 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
             ep_collisions = 0
             ep_planning_steps = 0
             ep_completion = 0.0
-            last_meta = {"latency_ms": 0.0, "difficulty": 0.0}
+            last_meta = {"latency_ms": 0.0, "difficulty": 0.0, "collision_risk": 0.0}
             ppo_stats, wm_stats = {}, {"loss_wm": 0.0}
             aux_loss_val = 0.0
             wm_ens_loss_val = 0.0
+            tp_stats, tp_eval = {}, {}
 
             for scenario_id in scenario_ids:
                 buffer.clear()
@@ -395,6 +412,10 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
 
                 while not buffer.is_full():
                     state = torch.as_tensor(obs, dtype=torch.float32, device=device)
+                    # Feed tracked agent histories so S-DBS plans against
+                    # predicted (not static) VRU/vehicle futures.
+                    if tp_trainer.is_ready():
+                        info["agent_histories"] = env.get_agent_histories()
                     best_action, plan, meta = sdbs_planner.plan(state, info)
                     last_meta = meta
                     ep_planning_steps += 1
@@ -499,9 +520,22 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
                         print(f"CURRICULUM: Advanced to stage "
                               f"{curriculum.current_stage()}")
 
+            # ---- traffic-predictor update (once collection is ready) ---- #
+            if tp_trainer.is_ready():
+                tp_batch = tp_trainer.trajectory_buffer.get_batch(config.tp_batch_size)
+                tp_stats = tp_trainer.update(tp_batch)
+                if episode % 50 == 0:
+                    tp_eval = tp_trainer.evaluate(tp_batch)
+                    if verbose:
+                        print(f"  TP eval | ADE={tp_eval['ade']:.3f} "
+                              f"FDE={tp_eval['fde']:.3f} "
+                              f"success_rate={tp_eval['success_rate']:.2%}")
+
             if verbose:
                 print(f"Episode {episode:04d} | stage={curriculum.current_stage()} | "
                       f"return={ep_return:.2f} | difficulty={last_meta['difficulty']:.2f} "
+                      f"| collision_risk={last_meta.get('collision_risk', 0.0):.2f} "
+                      f"| tp_loss={tp_stats.get('loss', 0.0):.4f} "
                       f"| planning_latency={last_meta['latency_ms']:.1f}ms | "
                       f"vru_collisions={ep_collisions}")
 
@@ -520,6 +554,11 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
                 "route_completion": ep_completion,
                 "stage": curriculum.current_stage(),
                 "difficulty": last_meta.get("difficulty", 0.0),
+                "collision_risk": last_meta.get("collision_risk", 0.0),
+                "tp_loss": tp_stats.get("loss", 0.0),
+                "tp_ade": tp_eval.get("ade", tp_stats.get("ade", 0.0)),
+                "tp_fde": tp_eval.get("fde", tp_stats.get("fde", 0.0)),
+                "tp_success_rate": tp_eval.get("success_rate", 0.0),
                 "planning_latency_ms": last_meta.get("latency_ms", 0.0),
             }
             history.append(record)

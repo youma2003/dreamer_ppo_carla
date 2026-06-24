@@ -39,6 +39,19 @@ class Config:
     w_risk: float = 2.0
     w_value: float = 0.5
 
+    # Traffic prediction
+    predict_horizon: int = 8           # predict 8 steps (0.8 s at 10 Hz) ahead
+    tp_batch_size: int = 128
+    lr_tp: float = 1e-3                # learning rate for the predictor
+    tp_hidden_dim: int = 128
+    collect_prediction_data: bool = True   # collect data in a first phase
+    tp_collect_episodes: int = 100     # episodes of trajectory data to pre-collect
+    tp_min_ready: int = 1000           # trajectories needed before predictor is used
+
+    # Prediction weighting in planning
+    lambda_collision: float = 1.0      # weight of predicted-collision risk in scoring
+    prediction_threshold: float = 0.1  # uncertainty threshold for caution
+
     # Reward weights
     w_prog: float = 1.0
     w_vru: float = 2.0

@@ -3,6 +3,8 @@
 In mock mode no `carla` import is attempted, so every component of the
 project can be developed and tested locally without CARLA installed.
 """
+from collections import deque
+
 import numpy as np
 
 from configs.config import Config
@@ -35,6 +37,12 @@ class CarlaEnv:
         self._state = None
         self._prev_action = np.zeros(self.action_dim, dtype=np.float32)
         self._scenario_id = None        # set by reset_to_scenario (S-DBS curriculum)
+
+        # Multi-agent trajectory tracking (for the traffic predictor).
+        self.history_length = 5
+        self.vru_history = {}           # vru_id -> deque of (x, y, vx, vy, class)
+        self.vehicle_history = {}       # vehicle_id -> deque of (x, y, vx, vy, class)
+        self.collected_trajectories = []
 
         # CARLA handles (real mode only).
         self.client = None
@@ -159,7 +167,63 @@ class CarlaEnv:
             "lane_departures": int(lane_departure),
         }
         info["vru_risk"] = compute_vru_risk_target(state, info, self.config)
+        info["vru_list"], info["vehicle_list"] = self._build_agent_lists(state)
         return info
+
+    # ------------------------------------------------------------------ #
+    # Multi-agent tracking
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _build_agent_lists(state):
+        """Derive per-agent observations (absolute pos + velocity) from a state.
+
+        Returns ``(vru_list, vehicle_list)`` — lists of dicts with keys
+        ``id, x, y, vx, vy``. Velocity is reconstructed from the per-agent
+        speed/heading fields; absolute position from ego pos + relative offset.
+        """
+        s = np.asarray(state, dtype=np.float32)
+        ego_x, ego_y = float(s[0]), float(s[1])
+
+        def make(agent_id, dist_i, speed_i, head_i, relx_i, rely_i):
+            speed = float(s[speed_i])
+            heading = float(s[head_i])
+            return {
+                "id": agent_id,
+                "x": ego_x + float(s[relx_i]),
+                "y": ego_y + float(s[rely_i]),
+                "vx": speed * np.cos(heading),
+                "vy": speed * np.sin(heading),
+            }
+
+        vru_list = [
+            make("vru0", 18, 19, 20, 21, 22),
+            make("vru1", 23, 24, 25, 26, 27),
+        ]
+        vehicle_list = [make("veh0", 13, 14, 15, 16, 17)]
+        return vru_list, vehicle_list
+
+    def _track_agents(self, info):
+        """Append the current agent observations to the rolling histories."""
+        for vru in info.get("vru_list", []):
+            hist = self.vru_history.setdefault(
+                vru["id"], deque(maxlen=self.history_length))
+            hist.append((vru["x"], vru["y"], vru["vx"], vru["vy"], 0))   # 0=ped
+        for veh in info.get("vehicle_list", []):
+            hist = self.vehicle_history.setdefault(
+                veh["id"], deque(maxlen=self.history_length))
+            hist.append((veh["x"], veh["y"], veh["vx"], veh["vy"], 2))   # 2=vehicle
+
+    def get_agent_histories(self):
+        """Dict ``agent_id -> history array (history_length, 5)`` (left-padded)."""
+        out = {}
+        for agent_id, hist in {**self.vru_history, **self.vehicle_history}.items():
+            if not hist:
+                continue
+            rows = list(hist)
+            while len(rows) < self.history_length:
+                rows.insert(0, rows[0])
+            out[agent_id] = np.asarray(rows[-self.history_length:], dtype=np.float32)
+        return out
 
     # ------------------------------------------------------------------ #
     # Gym-style API
@@ -167,6 +231,8 @@ class CarlaEnv:
     def reset(self):
         self._step_count = 0
         self._prev_action = np.zeros(self.action_dim, dtype=np.float32)
+        self.vru_history.clear()
+        self.vehicle_history.clear()
 
         if self.mock:
             self._state = self._random_state()
@@ -205,6 +271,7 @@ class CarlaEnv:
                 info, self.config,
             )
             info["reward_components"] = components
+            self._track_agents(info)
             self._step_count += 1
             done = bool(
                 info["collision"]
@@ -225,6 +292,7 @@ class CarlaEnv:
             info, self.config,
         )
         info["reward_components"] = components
+        self._track_agents(info)
         self._step_count += 1
         done = bool(
             self._collision_flag
@@ -283,6 +351,7 @@ class CarlaEnv:
             "lane_departures": int(lane_departure),
         }
         info["vru_risk"] = compute_vru_risk_target(state, info, self.config)
+        info["vru_list"], info["vehicle_list"] = self._build_agent_lists(state)
         return info
 
     def close(self):

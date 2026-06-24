@@ -42,6 +42,7 @@ class Plan:
     first_log_prob: float = 0.0
     first_value: float = 0.0
     serendipity_value: float = 0.0
+    collision_risk: float = 0.0        # predicted multi-agent collision risk
 
 
 # ---------------------------------------------------------------------- #

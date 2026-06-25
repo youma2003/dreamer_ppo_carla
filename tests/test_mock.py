@@ -397,6 +397,71 @@ def test_dreamer_ppo_tier2_generalization(config):
     ok("dreamer_ppo_tier2_generalization", "2 episodes with features/defensive")
 
 
+def test_dreamer_ppo_tier3_logging(config):
+    import csv as _csv
+    import shutil
+    import tempfile
+    from configs.sdbs_config import SDBSConfig
+    from training.dreamer_ppo import train_sdbs
+    from models.actor_critic import ActorCritic
+    from models.world_model import WorldModel
+    from planning.sdbs_planner import SDBSPlanner
+
+    tmp = tempfile.mkdtemp(prefix="tier3_mock_")
+    try:
+        small = SDBSConfig()
+        small.rollout_size = 128
+        small.update_epochs = 1
+        small.batch_size = 64
+        small.max_episode_steps = 20
+        small.wm_warmup_steps = 0
+        small.wm_batch_size = 64
+        small.beam_width_max = 6
+        small.horizon_max = 2
+        small.num_groups_max = 2
+        small.compute_budget = 30
+        small.scenarios_per_stage = 2
+        small.max_scenarios_per_episode = 2
+        small.collect_prediction_data = False
+        history = train_sdbs(small, mock=True, num_episodes=2, verbose=False,
+                             log_dir=tmp, ckpt_dir=None)
+        assert len(history) == 2
+        # SafetyTracker metrics present in each record.
+        for h in history:
+            for key in ("vru_near_misses", "vehicle_near_misses",
+                        "lane_change_success_rate", "episode_duration",
+                        "avg_planning_latency_ms"):
+                assert key in h, key
+            assert h["episode_duration"] > 0
+
+        # Logger wrote a complete CSV with the safety columns.
+        with open(os.path.join(tmp, "training_log.csv"),
+                  newline="", encoding="utf-8") as f:
+            cols = _csv.DictReader(f).fieldnames
+        for c in ("vru_collisions", "vehicle_collisions", "lane_changes_safe",
+                  "min_ttc_vru", "rear_incidents"):
+            assert c in cols, c
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # LaneChangeExplainer logs a decision when a lane change is planned.
+    cfg = SDBSConfig()
+    cfg.compute_budget = 30
+    policy = ActorCritic(cfg.state_dim, cfg.action_dim, cfg.hidden)
+    wm = WorldModel(cfg.state_dim, cfg.action_dim, cfg.wm_hidden)
+    planner = SDBSPlanner(policy, wm, policy, cfg)
+    state = np.zeros(cfg.state_dim, dtype=np.float32)
+    state[7] = 3.5
+    state[10] = 2.0          # green light
+    state[11] = 50.0
+    for idx in (13, 18, 23, 28):
+        state[idx] = 100.0   # vehicles far
+    state[38] = state[43] = 50.0     # VRUs far
+    planner.plan(state, {"requested_action_steering": 0.5})
+    assert len(planner.explainer.lane_change_log) >= 1
+    ok("dreamer_ppo_tier3_logging", "2 episodes with full safety tracking")
+
+
 def main():
     config = Config()
     print("Running Dreamer-PPO mock pipeline tests (no CARLA needed)...\n")
@@ -417,6 +482,7 @@ def main():
     test_dreamer_ppo_with_prediction(config)
     test_dreamer_ppo_tier1_safety(config)
     test_dreamer_ppo_tier2_generalization(config)
+    test_dreamer_ppo_tier3_logging(config)
     print("\n✅ ALL TESTS PASSED")
 
 

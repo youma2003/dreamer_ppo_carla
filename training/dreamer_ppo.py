@@ -330,6 +330,7 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
     from models.traffic_predictor import TrafficPredictor
     from training.traffic_prediction_trainer import TrafficPredictionTrainer
     from training.map_agnostic_state import MapAgnosticStateWrapper
+    from utils.safety_tracker import SafetyTracker
 
     config = config or SDBSConfig()
     if num_episodes is not None:
@@ -402,6 +403,7 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
         os.makedirs(ckpt_dir, exist_ok=True)
     best_eval_return = -float("inf")
     aux_ready = max(32, min(config.wm_batch_size, 64))
+    safety_tracker = SafetyTracker()
 
     history = []
     try:
@@ -413,10 +415,13 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
                     config.max_scenarios_per_episode
                 )
 
+            safety_tracker.reset()
             ep_return = 0.0
             ep_collisions = 0
             ep_planning_steps = 0
             ep_completion = 0.0
+            ep_latency_sum = 0.0
+            ep_reward_components = defaultdict(float)
             last_meta = {"latency_ms": 0.0, "difficulty": 0.0, "collision_risk": 0.0}
             ppo_stats, wm_stats = {}, {"loss_wm": 0.0}
             aux_loss_val = 0.0
@@ -439,8 +444,32 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
                     ep_planning_steps += 1
                     action_np = best_action.cpu().numpy()
 
+                    safety_tracker.step()
+                    ep_latency_sum += meta.get("latency_ms", 0.0)
+                    # Lane-change accounting from the planner's mandate decision.
+                    if meta.get("mandate") == "stay_in_lane":
+                        safety_tracker.record_lane_change(
+                            is_safe=False, blocked_by_mandate=True)
+                    elif abs(float(action_np[0])) > 0.3:
+                        safety_tracker.record_lane_change(is_safe=True)
+
                     next_obs, reward, done, info = env.step(action_np)
                     next_obs = _augment(next_obs, info)
+
+                    # Tier-3: accumulate per-step safety metrics.
+                    for d, ttc in zip(info.get("vru_distance_list", []),
+                                      info.get("vru_ttc_list", [])):
+                        safety_tracker.record_vru_observation(d, 0.0, ttc)
+                    for d, ttc, dirn in zip(info.get("vehicle_distance_list", []),
+                                            info.get("vehicle_ttc_list", []),
+                                            info.get("vehicle_directions", [])):
+                        safety_tracker.record_vehicle_observation(d, 0.0, ttc, dirn)
+                    if info.get("collision_with_vehicle"):
+                        safety_tracker.record_vehicle_collision()
+                    if info.get("vru_collisions", 0):
+                        safety_tracker.record_vru_collision()
+                    for ck, cv in info.get("reward_components", {}).items():
+                        ep_reward_components[ck] += cv
 
                     # Intrinsic reward from serendipitous discoveries.
                     if meta.get("serendipity_bonus_used"):
@@ -479,6 +508,7 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
                             "near_misses": int(info.get("near_misses", 0)),
                             "route_completion": ep_completion,
                         })
+                        safety_tracker.record_episode_completion(ep_completion)
                         obs = _augment(env.reset_to_scenario(scenario_id), info)
 
                 if buffer.path_start < buffer.ptr:
@@ -561,6 +591,9 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
                       f"| planning_latency={last_meta['latency_ms']:.1f}ms | "
                       f"vru_collisions={ep_collisions}")
 
+            safety_summary = safety_tracker.summarize()
+            avg_latency = (ep_latency_sum / ep_planning_steps
+                           if ep_planning_steps else 0.0)
             record = {
                 "episode": episode,
                 "return": ep_return,
@@ -579,15 +612,34 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
                 "collision_risk": last_meta.get("collision_risk", 0.0),
                 "state_dim": obs_dim,
                 "defensive_mode": int(defensive_on),
+                "defensive_mode_active": int(defensive_on),
                 "tp_loss": tp_stats.get("loss", 0.0),
                 "tp_ade": tp_eval.get("ade", tp_stats.get("ade", 0.0)),
                 "tp_fde": tp_eval.get("fde", tp_stats.get("fde", 0.0)),
                 "tp_success_rate": tp_eval.get("success_rate", 0.0),
                 "planning_latency_ms": last_meta.get("latency_ms", 0.0),
+                "avg_planning_latency_ms": avg_latency,
+                # Tier-3 reward components + separated safety metrics.
+                "r_progress": ep_reward_components.get("progress", 0.0),
+                "r_vru": ep_reward_components.get("vru_risk", 0.0),
+                "r_collision": ep_reward_components.get("collision", 0.0),
+                "r_vehicle_collision": ep_reward_components.get("vehicle_collision", 0.0),
+                "r_vehicle_proximity": ep_reward_components.get("vehicle_proximity", 0.0),
+                "r_rear_risk": ep_reward_components.get("rear_risk", 0.0),
+                "r_comfort": ep_reward_components.get("comfort", 0.0),
+                "r_rules": ep_reward_components.get("rules", 0.0),
             }
+            record.update(safety_summary)
+            record["vru_collisions"] = max(ep_collisions,
+                                           safety_summary["vru_collisions"])
             history.append(record)
             if logger is not None:
                 logger.log(episode, record)
+
+            # ---- Tier-3: periodic interpretable summaries ---- #
+            if verbose and episode % 50 == 0 and logger is not None:
+                logger.create_summary_table()
+                sdbs_planner.explainer.print_summary()
 
             if ckpt_dir and episode % 100 == 0:
                 _save_checkpoint(

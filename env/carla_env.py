@@ -217,6 +217,7 @@ class CarlaEnv:
         }
         info["vru_risk"] = compute_vru_risk_target(state, info, self.config)
         info["vru_list"], info["vehicle_list"] = self._build_agent_lists(state)
+        info.update(self._compute_safety_lists(state))
         return info
 
     # ------------------------------------------------------------------ #
@@ -251,6 +252,52 @@ class CarlaEnv:
         ]
         vehicle_list = [make("veh0", 13, 14, 15, 16, 17)]
         return vru_list, vehicle_list
+
+    @staticmethod
+    def _compute_safety_lists(state):
+        """Per-step TTC / distance lists for VRUs and vehicles (for tracking).
+
+        Returns a dict with parallel ``*_ttc_list`` / ``*_distance_list`` and,
+        for vehicles, a ``vehicle_directions`` list (front/rear/left/right).
+        TTC uses the direction-appropriate closing speed; non-closing pairs get
+        a large TTC so they are not counted as near-misses.
+        """
+        s = np.asarray(state, dtype=np.float32)
+        ego_speed = float(s[EGO_SPEED])
+
+        vru_ttc, vru_dist = [], []
+        for idx in (VRU1_DIST, VRU2_DIST):
+            dist = float(s[idx])
+            if dist <= 0:
+                continue
+            vru_dist.append(dist)
+            vru_ttc.append(dist / max(0.1, ego_speed))
+
+        veh_ttc, veh_dist, veh_dirs = [], [], []
+        for base, direction in ((VEHICLE_AHEAD_DIST, "front"),
+                                (VEHICLE_BEHIND_DIST, "rear"),
+                                (VEHICLE_LEFT_DIST, "left"),
+                                (VEHICLE_RIGHT_DIST, "right")):
+            dist = float(s[base])
+            if dist <= 0 or dist >= 100:        # skip placeholder / far vehicles
+                continue
+            vspeed = float(s[base + 1])
+            if direction == "front":
+                closing = ego_speed - vspeed
+            elif direction == "rear":
+                closing = vspeed - ego_speed
+            else:
+                closing = abs(ego_speed - vspeed)
+            ttc = dist / closing if closing > 0 else 999.0
+            veh_dist.append(dist)
+            veh_ttc.append(ttc)
+            veh_dirs.append(direction)
+
+        return {
+            "vru_ttc_list": vru_ttc, "vru_distance_list": vru_dist,
+            "vehicle_ttc_list": veh_ttc, "vehicle_distance_list": veh_dist,
+            "vehicle_directions": veh_dirs,
+        }
 
     def _track_agents(self, info):
         """Append the current agent observations to the rolling histories."""
@@ -424,6 +471,7 @@ class CarlaEnv:
         }
         info["vru_risk"] = compute_vru_risk_target(state, info, self.config)
         info["vru_list"], info["vehicle_list"] = self._build_agent_lists(state)
+        info.update(self._compute_safety_lists(state))
         return info
 
     def close(self):

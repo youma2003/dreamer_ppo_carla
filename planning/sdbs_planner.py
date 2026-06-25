@@ -30,6 +30,7 @@ from planning.sdbs_core import (
     Plan, BeamState, compute_conflict_cells, jaccard_diversity,
 )
 from planning.defensive_driving import DefensiveDrivingController
+from planning.lane_change_explainer import LaneChangeExplainer
 from models.traffic_predictor import compute_collision_risk
 
 # State indices not re-exported by the reward module.
@@ -51,6 +52,19 @@ class SDBSPlanner:
         self.beam = None        # most recent BeamState (handy for inspection/tests)
         self._agent_predictions = {}   # cached per plan() call
         self.defensive_controller = DefensiveDrivingController(config)
+        self.explainer = LaneChangeExplainer()
+
+    def _infer_action_reason(self, action, state):
+        """Heuristic explanation for why the planner chose this action."""
+        steering, throttle, brake = float(action[0]), float(action[1]), float(action[2])
+        vehicle_ahead_dist = float(state[VEHICLE_AHEAD_DIST])
+        if abs(steering) > 0.3:
+            return "avoid_front_vehicle" if vehicle_ahead_dist < 10 else "reach_goal"
+        if brake > 0.5:
+            return "safety_brake"
+        if throttle > 0.5:
+            return "accelerate_progress"
+        return "maintain_course"
 
     # ------------------------------------------------------------------ #
     # Defensive-mode action filtering
@@ -453,6 +467,27 @@ class SDBSPlanner:
             best_searched.maneuver = "defensive"
 
         best_action = torch.as_tensor(exec_action_np, device=self.device)
+
+        # Tier-3: record lane-change decisions (executed or mandate-blocked).
+        requested_steer = float(info.get("requested_action_steering",
+                                         exec_action_np[0]))
+        blocked = mandate["mandate"] == "stay_in_lane"
+        if abs(requested_steer) > 0.3 or blocked:
+            direction = (mandate.get("direction") if blocked
+                         else ("left" if requested_steer < 0 else "right"))
+            reason = ("blocked_unsafe_lane_change" if blocked
+                      else self._infer_action_reason(exec_action_np, state_np))
+            self.explainer.record_decision(
+                timestep=int(info.get("timestep", 0)),
+                action=exec_action_np,
+                state=state_np,
+                info={**info, "scene_difficulty": difficulty,
+                      "defensive_mode": self.defensive_controller.defensive_mode_active},
+                mandate=(mandate if blocked else None),
+                is_safe=(not blocked),
+                reason=reason,
+                direction=direction,
+            )
 
         serendipity_used = bool(
             best_searched.group_id > 0

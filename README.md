@@ -53,6 +53,30 @@ The base Dreamer-PPO path is unchanged; `--sdbs` switches the training loop to
 `train_sdbs()`, which plugs the planner, curriculum, ensemble, and grounding
 heads into PPO.
 
+## Tier-3: Enhanced Logging & Interpretability
+
+Makes every episode auditable — what happened and why each safety decision was
+made.
+
+**SafetyTracker** (per episode) — separates the two safety classes:
+- VRU safety (primary): collisions, near-misses (TTC < 2.5 s), min TTC, avg distance
+- Vehicle safety (secondary): collisions, near-misses (TTC < 3 s), min TTC, rear incidents
+- Lane changes: attempted, safe, blocked-by-mandate, success rate
+
+**LaneChangeExplainer** (every maneuver) records when / which direction / why
+(`avoid_front_vehicle`, `reach_goal`, …) / whether a mandate blocked it / the
+rear-vehicle distance, and can `export_decisions()` to JSON.
+
+**Logger** writes a wide CSV separating VRU vs vehicle metrics and prints a
+summary table; `plot_results.py` adds `safety_comparison.png`,
+`lane_change_safety.png`, and `ttc_progression.png`.
+
+```
+python -m training.dreamer_ppo --mock --sdbs --episodes 2   # logs + prints summaries
+tail -5 logs/training_log.csv                               # safety columns per episode
+python plot_results.py --log logs/training_log.csv          # safety plots
+```
+
 ## Tier-2: Map-Agnostic Features & Defensive Driving
 
 Generalization to unknown CARLA towns (towns not in training).

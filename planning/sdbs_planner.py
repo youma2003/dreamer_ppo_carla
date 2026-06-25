@@ -29,6 +29,7 @@ from env.carla_env import (
 from planning.sdbs_core import (
     Plan, BeamState, compute_conflict_cells, jaccard_diversity,
 )
+from planning.defensive_driving import DefensiveDrivingController
 from models.traffic_predictor import compute_collision_risk
 
 # State indices not re-exported by the reward module.
@@ -49,6 +50,24 @@ class SDBSPlanner:
         self.device = torch.device(device)
         self.beam = None        # most recent BeamState (handy for inspection/tests)
         self._agent_predictions = {}   # cached per plan() call
+        self.defensive_controller = DefensiveDrivingController(config)
+
+    # ------------------------------------------------------------------ #
+    # Defensive-mode action filtering
+    # ------------------------------------------------------------------ #
+    def filter_risky_actions(self, candidate_actions, state, info):
+        """Drop risky candidates when defensive mode is active.
+
+        Returns the safe subset; if every candidate is risky, returns the first
+        one so planning always has something to fall back on.
+        """
+        if not self.defensive_controller.defensive_mode_active:
+            return list(candidate_actions)
+        safe = [a for a in candidate_actions
+                if not self.defensive_controller.is_risky_action(a, state, info)]
+        if not safe:
+            return [candidate_actions[0]]
+        return safe
 
     # ------------------------------------------------------------------ #
     # Scene difficulty -> search budget
@@ -424,6 +443,15 @@ class SDBSPlanner:
         else:
             exec_action_np = np.asarray(best_searched.actions[0], dtype=np.float32)
 
+        # Defensive mode: soften a risky chosen action (gentle steer, ease off).
+        if (self.defensive_controller.defensive_mode_active
+                and self.defensive_controller.is_risky_action(
+                    exec_action_np, state_np, info)):
+            exec_action_np = np.asarray(exec_action_np, dtype=np.float32).copy()
+            exec_action_np[0] = float(np.clip(exec_action_np[0], -0.2, 0.2))
+            exec_action_np[1] = float(min(exec_action_np[1], 0.3))
+            best_searched.maneuver = "defensive"
+
         best_action = torch.as_tensor(exec_action_np, device=self.device)
 
         serendipity_used = bool(
@@ -443,6 +471,7 @@ class SDBSPlanner:
             "serendipity_score": float(best_searched.serendipity_value),
             "collision_risk": float(best_searched.collision_risk),
             "predicted_agents": len(self._agent_predictions),
+            "defensive_mode": self.defensive_controller.defensive_mode_active,
             "planning_latency_ms": (time.perf_counter() - t0) * 1000.0,
             "latency_ms": (time.perf_counter() - t0) * 1000.0,
             "mandate": mandate["mandate"],

@@ -329,23 +329,37 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
     )
     from models.traffic_predictor import TrafficPredictor
     from training.traffic_prediction_trainer import TrafficPredictionTrainer
+    from training.map_agnostic_state import MapAgnosticStateWrapper
 
     config = config or SDBSConfig()
     if num_episodes is not None:
         config.num_episodes = num_episodes
     device = torch.device(device)
 
+    # Tier-2: optionally augment the env's base state with map-agnostic features.
+    # The env still produces base-dim observations; the wrapper appends the
+    # 7 computed features, so policy/world-model/buffers use the augmented dim.
+    # (config.state_dim is left unchanged so base index logic stays valid.)
+    state_wrapper = MapAgnosticStateWrapper(config)
+    obs_dim = (config.augmented_state_dim if config.use_map_agnostic_features
+               else config.state_dim)
+
+    def _augment(obs, info):
+        if config.use_map_agnostic_features:
+            return state_wrapper.augment_state(obs, info)
+        return np.asarray(obs, dtype=np.float32)
+
     env = CarlaEnv(mock=mock, config=config)
-    policy = ActorCritic(config.state_dim, config.action_dim, config.hidden).to(device)
-    world_model = WorldModel(config.state_dim, config.action_dim,
+    policy = ActorCritic(obs_dim, config.action_dim, config.hidden).to(device)
+    world_model = WorldModel(obs_dim, config.action_dim,
                              config.wm_hidden).to(device)
     optimizer_pi = torch.optim.Adam(policy.parameters(), lr=config.lr_policy)
 
     buffer = RolloutBuffer(
-        config.rollout_size, config.state_dim, config.action_dim,
+        config.rollout_size, obs_dim, config.action_dim,
         gamma=config.gamma, lam=config.lam,
     )
-    wm_buffer = WorldModelBuffer(capacity=50_000, state_dim=config.state_dim,
+    wm_buffer = WorldModelBuffer(capacity=50_000, state_dim=obs_dim,
                                  action_dim=config.action_dim)
     wm_trainer = WorldModelTrainer(world_model, config)
 
@@ -364,11 +378,14 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
 
     sdbs_planner = SDBSPlanner(policy, world_model, policy, config,
                                traffic_predictor=traffic_predictor, device=device)
+    # Tier-2: enter defensive mode up front (e.g. unknown map / manual request).
+    if config.defensive_mode:
+        sdbs_planner.defensive_controller.activate_defensive_mode()
     curriculum = RiskAwareCurriculum(config)
     scenario_replayer = curriculum.replayer
 
     world_model_ensemble = WorldModelEnsemble(
-        type(world_model), config.state_dim, config.action_dim,
+        type(world_model), obs_dim, config.action_dim,
         n_models=config.world_model_ensemble_size, device=device,
     )
     wm_ensemble_opt = torch.optim.Adam(world_model_ensemble.parameters(),
@@ -408,8 +425,8 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
 
             for scenario_id in scenario_ids:
                 buffer.clear()
-                obs = env.reset_to_scenario(scenario_id)
                 info = {}
+                obs = _augment(env.reset_to_scenario(scenario_id), info)
 
                 while not buffer.is_full():
                     state = torch.as_tensor(obs, dtype=torch.float32, device=device)
@@ -423,6 +440,7 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
                     action_np = best_action.cpu().numpy()
 
                     next_obs, reward, done, info = env.step(action_np)
+                    next_obs = _augment(next_obs, info)
 
                     # Intrinsic reward from serendipitous discoveries.
                     if meta.get("serendipity_bonus_used"):
@@ -461,7 +479,7 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
                             "near_misses": int(info.get("near_misses", 0)),
                             "route_completion": ep_completion,
                         })
-                        obs = env.reset_to_scenario(scenario_id)
+                        obs = _augment(env.reset_to_scenario(scenario_id), info)
 
                 if buffer.path_start < buffer.ptr:
                     with torch.no_grad():
@@ -532,8 +550,11 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
                               f"FDE={tp_eval['fde']:.3f} "
                               f"success_rate={tp_eval['success_rate']:.2%}")
 
+            defensive_on = sdbs_planner.defensive_controller.defensive_mode_active
             if verbose:
                 print(f"Episode {episode:04d} | stage={curriculum.current_stage()} | "
+                      f"state_dim={obs_dim} | "
+                      f"defensive={'ON' if defensive_on else 'OFF'} | "
                       f"return={ep_return:.2f} | difficulty={last_meta['difficulty']:.2f} "
                       f"| collision_risk={last_meta.get('collision_risk', 0.0):.2f} "
                       f"| tp_loss={tp_stats.get('loss', 0.0):.4f} "
@@ -556,6 +577,8 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
                 "stage": curriculum.current_stage(),
                 "difficulty": last_meta.get("difficulty", 0.0),
                 "collision_risk": last_meta.get("collision_risk", 0.0),
+                "state_dim": obs_dim,
+                "defensive_mode": int(defensive_on),
                 "tp_loss": tp_stats.get("loss", 0.0),
                 "tp_ade": tp_eval.get("ade", tp_stats.get("ade", 0.0)),
                 "tp_fde": tp_eval.get("fde", tp_stats.get("fde", 0.0)),

@@ -205,6 +205,8 @@ class CarlaEnv:
             "stop_sign_violation": bool(self.rng.random() < 0.02),   # 2%
             "crosswalk_conflict": bool(self.rng.random() < 0.05),    # 5%
             "general_risk": float(self.rng.uniform(0.0, 0.3)),
+            "weather": "clear",
+            "time_of_day": "day",
             # `progress` is the real per-step route advance (used as the
             # world-model progress target); it stays consistent with the
             # reward instead of being pure noise.
@@ -240,6 +242,7 @@ class CarlaEnv:
                 "y": ego_y + float(s[rely_i]),
                 "vx": speed * np.cos(heading),
                 "vy": speed * np.sin(heading),
+                "distance": float(s[dist_i]),
             }
 
         vru_list = [

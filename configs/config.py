@@ -68,6 +68,23 @@ class Config:
     rear_risk_threshold: float = 3.0    # seconds TTC for a rear-collision penalty
     vehicle_proximity_sigma: float = 5.0    # distance scale for proximity penalty
     min_lane_change_clearance: float = 2.0  # min safe side gap for a lane change
+
+    # Map-agnostic features (Tier 2: generalization to unknown towns)
+    use_map_agnostic_features: bool = True   # augment state with computed features
+    # 55 = 48 base + 7 features (in_lane_center + road-type one-hot[4] +
+    # visibility + oncoming). The brief said "49"; that assumed the 42-dim
+    # pre-Tier-1 state — with the 48-dim base it is 55.
+    augmented_state_dim: int = 55
+
+    # Defensive driving mode (for unknown maps)
+    defensive_mode: bool = False             # start in defensive mode
+    unknown_map_detection: str = "manual"    # 'manual' or 'gps_comparison'
+    defensive_w_vru_mult: float = 1.5        # increase VRU weight
+    defensive_w_vehicle_mult: float = 1.5    # increase vehicle-safety weight
+    defensive_lambda_collision_mult: float = 2.0   # harsher collision penalty
+    defensive_dream_k: int = 8               # more candidate actions
+    defensive_horizon_max: int = 5           # deeper lookahead
+    defensive_disable_risky_maneuvers: bool = True
     sigma_d: float = 5.0
     lambda_ttc: float = 0.5
     tau_ttc: float = 2.0

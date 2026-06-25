@@ -53,6 +53,34 @@ The base Dreamer-PPO path is unchanged; `--sdbs` switches the training loop to
 `train_sdbs()`, which plugs the planner, curriculum, ensemble, and grounding
 heads into PPO.
 
+## Tier-2: Map-Agnostic Features & Defensive Driving
+
+Generalization to unknown CARLA towns (towns not in training).
+
+**Map-agnostic features** (state augmentation **48 → 55 dims**) — computed,
+not memorized, so they transfer to unseen maps:
+- `in_lane_center` — how centered the car is in its lane, [0, 1]
+- `road_type` — straight / curve / intersection (one-hot, 4 dims)
+- `visibility` — estimated from weather + VRU/vehicle density, [0, 1]
+- `oncoming_traffic` — is there traffic in the opposing direction? (binary)
+
+**Defensive driving mode** (auto-activated on unknown maps):
+- VRU weight ×1.5, vehicle-safety weight ×1.5, collision penalty ×2.0
+- deeper planning (H up to 5) and more candidate actions
+- blocks aggressive maneuvers (hard steering in intersections, speed in low
+  visibility, accelerating into a close lead vehicle)
+
+```
+python tests/test_tier2_generalization.py    # 8 checks
+python -m training.dreamer_ppo --mock --sdbs --episodes 2   # logs state_dim=55, defensive ON/OFF
+```
+
+Result: the car drives cautiously on unseen maps without retraining.
+
+> The augmented state is **55-dim** (48 base + 7 features). The brief said
+> "42 → 49"; that assumed the pre-Tier-1 state — with the 48-dim base it is 55.
+> `use_map_agnostic_features` (default on) and `defensive_mode` are config flags.
+
 ## Tier-1 Traffic Safety (rear/side awareness)
 
 The state vector was expanded **28 → 48 dims** to give the car blind-spot

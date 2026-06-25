@@ -367,6 +367,36 @@ def test_dreamer_ppo_tier1_safety(config):
     ok("dreamer_ppo_tier1_safety", "2 episodes with new state/rewards")
 
 
+def test_dreamer_ppo_tier2_generalization(config):
+    from configs.sdbs_config import SDBSConfig
+    from training.dreamer_ppo import train_sdbs
+    small = SDBSConfig()
+    small.rollout_size = 128
+    small.update_epochs = 1
+    small.batch_size = 64
+    small.max_episode_steps = 20
+    small.wm_warmup_steps = 0
+    small.wm_batch_size = 64
+    small.beam_width_max = 6
+    small.horizon_max = 2
+    small.num_groups_max = 2
+    small.compute_budget = 30
+    small.scenarios_per_stage = 2
+    small.max_scenarios_per_episode = 2
+    small.collect_prediction_data = False
+    small.use_map_agnostic_features = True     # 48 -> 55 augmented state
+    small.defensive_mode = True                # force defensive mode on
+    base_w_vru = small.w_vru
+    history = train_sdbs(small, mock=True, num_episodes=2, verbose=False,
+                         log_dir=None, ckpt_dir=None)
+    assert len(history) == 2
+    for h in history:
+        assert h["state_dim"] == 55                 # augmented state used
+        assert h["defensive_mode"] == 1             # defensive mode active
+    assert small.w_vru > base_w_vru                 # defensive scaled the weights
+    ok("dreamer_ppo_tier2_generalization", "2 episodes with features/defensive")
+
+
 def main():
     config = Config()
     print("Running Dreamer-PPO mock pipeline tests (no CARLA needed)...\n")
@@ -386,6 +416,7 @@ def main():
     test_full_sdbs_loop(config)
     test_dreamer_ppo_with_prediction(config)
     test_dreamer_ppo_tier1_safety(config)
+    test_dreamer_ppo_tier2_generalization(config)
     print("\n✅ ALL TESTS PASSED")
 
 

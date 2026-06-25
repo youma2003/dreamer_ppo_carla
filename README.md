@@ -53,6 +53,28 @@ The base Dreamer-PPO path is unchanged; `--sdbs` switches the training loop to
 `train_sdbs()`, which plugs the planner, curriculum, ensemble, and grounding
 heads into PPO.
 
+## Tier-1 Traffic Safety (rear/side awareness)
+
+The state vector was expanded **28 → 48 dims** to give the car blind-spot
+awareness: alongside the vehicle ahead it now observes vehicles **behind,
+left, right, and the nearest in any direction** (each a 5-dim block of
+`dist, speed, heading, rel_x, rel_y`). On top of that:
+
+- **Reward** penalizes vehicle collisions, close proximity in any direction,
+  and rear-collision risk (a fast vehicle closing from behind).
+- **Lane-change mandate**: before a lane change (|steering| > 0.3), S-DBS
+  checks the target side; if a vehicle is within the (speed-scaled) clearance
+  it issues a `stay_in_lane` mandate and clamps steering, preventing the
+  blind-spot near-collisions.
+
+```
+python tests/test_tier1_safety.py     # 7 checks: state size, detection, rewards, mandates
+```
+
+> The layout is 48-dimensional: 28 + four new 5-dim vehicle blocks. (The task
+> brief said "42"; that is an arithmetic slip — the VRU index constants 38/43
+> require 48.)
+
 ## Traffic Prediction
 
 Agents no longer assumed static. A multi-agent trajectory predictor learns to

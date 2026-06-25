@@ -4,13 +4,17 @@ Full implementation of the reward terms from the project spec: progress,
 VRU risk (proximity + TTC + crosswalk), safety (collision / lane departure /
 general risk), comfort (action smoothness), and traffic-rule violations.
 
-State vector layout (dim=28), matching env/carla_env.py:
+State vector layout (dim=48), matching env/carla_env.py:
   ego (6):     [0] x, [1] y, [2] speed, [3] heading, [4] acc_x, [5] acc_y
   lane (4):    [6] lane_offset, [7] lane_width, [8] road_curvature, [9] is_junction
   traffic (3): [10] traffic_light_state, [11] dist_to_light, [12] route_progress
-  vehicles (5):[13] dist, [14] speed, [15] heading, [16] rel_x, [17] rel_y
+  vehicle ahead (5):   [13] dist, [14] speed, [15] heading, [16] rel_x, [17] rel_y
+  vehicle behind (5):  [18..22]  (Tier-1: rear awareness)
+  vehicle left (5):    [23..27]  (Tier-1: blind-spot awareness)
+  vehicle right (5):   [28..32]  (Tier-1: blind-spot awareness)
+  vehicle nearest (5): [33..37]  (Tier-1: any-direction nearest)
   VRU (10):    2 VRUs x (dist, speed, heading, rel_x, rel_y)
-               VRU0: [18..22], VRU1: [23..27]
+               VRU0: [38..42], VRU1: [43..47]
 
 NOTE on the goal index: the spec lists ``DIST_TO_GOAL = 8``, but index 8 is
 ``road_curvature`` in this state layout. The actual goal signal is
@@ -26,8 +30,17 @@ EGO_HEADING = 3
 LANE_OFFSET = 6
 ROUTE_PROGRESS = 12          # route completion in [0,1] (the goal signal)
 
-VRU1_DIST = 18               # first VRU block starts here
-VRU2_DIST = 23               # second VRU block starts here
+# Vehicle blocks (each: dist, speed, heading, rel_x, rel_y).
+VEHICLE_AHEAD_DIST = 13
+VEHICLE_BEHIND_DIST = 18
+VEHICLE_LEFT_DIST = 23
+VEHICLE_RIGHT_DIST = 28
+VEHICLE_NEAREST_DIST = 33
+VEHICLE_DIST_INDICES = (VEHICLE_AHEAD_DIST, VEHICLE_BEHIND_DIST,
+                        VEHICLE_LEFT_DIST, VEHICLE_RIGHT_DIST)
+
+VRU1_DIST = 38               # first VRU block starts here
+VRU2_DIST = 43               # second VRU block starts here
 VRU_BLOCK_SIZE = 5           # dist, speed, heading, rel_x, rel_y
 VRU_DIST_INDICES = (VRU1_DIST, VRU2_DIST)
 
@@ -82,11 +95,36 @@ def compute_reward(state, next_state, action, prev_action, info, config):
     r_stop_sign = -1.0 if info.get("stop_sign_violation", False) else 0.0
     r_rules = r_red_light + r_stop_sign
 
+    # ---- 6. GENERAL VEHICLE SAFETY (Tier 1) --------------------------- #
+    # Vehicle collision: hard penalty, less severe than a VRU hit (-10).
+    r_vehicle_collision = -8.0 if info.get("collision_with_vehicle", False) else 0.0
+
+    # Proximity: keep distance from vehicles in every direction.
+    r_vehicle_proximity = 0.0
+    for idx in (VEHICLE_AHEAD_DIST, VEHICLE_BEHIND_DIST,
+                VEHICLE_LEFT_DIST, VEHICLE_RIGHT_DIST):
+        dist_v = float(next_state[idx])
+        if dist_v < 50.0:           # only penalize vehicles within 50 m
+            r_vehicle_proximity -= np.exp(-dist_v / config.vehicle_proximity_sigma)
+
+    # Rear-collision risk: a fast vehicle close behind is dangerous.
+    r_rear_risk = 0.0
+    behind_dist = float(next_state[VEHICLE_BEHIND_DIST])
+    behind_speed = float(next_state[VEHICLE_BEHIND_DIST + 1])
+    if behind_dist < 10.0:
+        # TTC if the rear vehicle keeps closing on the (slower) ego.
+        ttc_rear = behind_dist / max(0.1, behind_speed - ego_speed)
+        if 0.0 < ttc_rear < config.rear_risk_threshold:
+            r_rear_risk = -(config.rear_risk_threshold - ttc_rear)
+
+    r_vehicle_safety = r_vehicle_collision + r_vehicle_proximity + r_rear_risk
+
     # ---- TOTAL -------------------------------------------------------- #
     r_total = (
         config.w_prog * r_progress
         + config.w_vru * r_vru
         + config.w_safe * (r_collision + r_lane_depart + r_general_risk)
+        + config.w_vehicle * r_vehicle_safety
         + config.w_comfort * r_comfort
         + config.w_rules * r_rules
     )
@@ -96,6 +134,9 @@ def compute_reward(state, next_state, action, prev_action, info, config):
         "vru_risk": r_vru,
         "collision": r_collision,
         "lane_depart": r_lane_depart,
+        "vehicle_collision": r_vehicle_collision,
+        "vehicle_proximity": float(r_vehicle_proximity),
+        "rear_risk": float(r_rear_risk),
         "comfort": r_comfort,
         "rules": r_rules,
         "total": float(r_total),

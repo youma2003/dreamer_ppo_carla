@@ -23,6 +23,9 @@ import numpy as np
 import torch
 
 from rewards.vru_reward import EGO_X, EGO_Y, EGO_SPEED, VRU_DIST_INDICES
+from env.carla_env import (
+    VEHICLE_AHEAD_DIST, VEHICLE_BEHIND_DIST, VEHICLE_LEFT_DIST, VEHICLE_RIGHT_DIST,
+)
 from planning.sdbs_core import (
     Plan, BeamState, compute_conflict_cells, jaccard_diversity,
 )
@@ -31,6 +34,8 @@ from models.traffic_predictor import compute_collision_risk
 # State indices not re-exported by the reward module.
 TRAFFIC_LIGHT_STATE = 10
 DIST_TO_LIGHT = 11
+LANE_CHANGE_STEER_THRESHOLD = 0.3   # |steering| above this = a lane-change attempt
+LANE_CHANGE_STEER_CLAMP = 0.2       # clamp steering to +-this when staying in lane
 
 
 class SDBSPlanner:
@@ -120,6 +125,31 @@ class SDBSPlanner:
 
         if info.get("right_of_way_violation"):
             return {"mandate": "yield", "clamped_controls": yield_ctrl}
+
+        # ---- Lane-change blind-spot safety (Tier 1) ------------------- #
+        # A lane change is requested when |steering| exceeds the threshold;
+        # steering < 0 turns left, > 0 turns right. If a vehicle occupies the
+        # target side within the (speed-scaled) clearance, block the change by
+        # clamping steering to keep the car in its lane.
+        requested_steer = float(info.get("requested_action_steering", 0.0))
+        if abs(requested_steer) > LANE_CHANGE_STEER_THRESHOLD:
+            if requested_steer < 0:
+                target = s[VEHICLE_LEFT_DIST:VEHICLE_LEFT_DIST + 5]
+                direction = "left"
+            else:
+                target = s[VEHICLE_RIGHT_DIST:VEHICLE_RIGHT_DIST + 5]
+                direction = "right"
+            target_dist, target_speed = float(target[0]), float(target[1])
+            speed_buffer = 0.5 * abs(target_speed - ego_speed)
+            min_safe = cfg.min_lane_change_clearance + speed_buffer
+            if target_dist < min_safe and target_dist < 100.0:
+                return {
+                    "mandate": "stay_in_lane",
+                    "clamped_controls": None,   # plan() clamps steering in place
+                    "direction": direction,
+                    "reason": (f"unsafe {direction} lane change "
+                               f"(vehicle at {target_dist:.1f}m)"),
+                }
 
         return {"mandate": None, "clamped_controls": None}
 
@@ -284,6 +314,15 @@ class SDBSPlanner:
 
         difficulty = self.estimate_scene_difficulty(state_np, info)
         B, H, G = self.get_search_params(difficulty)
+
+        # The policy's intended steering (squashed mean) drives the lane-change
+        # blind-spot check, unless the caller already supplied one.
+        if "requested_action_steering" not in info:
+            mean, _std, _value = self.policy.forward(
+                torch.as_tensor(state_np, device=self.device))
+            info = dict(info)
+            info["requested_action_steering"] = float(
+                torch.tanh(mean.reshape(-1)[0]).item())
         mandate = self.evaluate_mandated_safety(state_np, info)
 
         # Predict every tracked agent's future once; scoring reuses it per plan.
@@ -373,9 +412,15 @@ class SDBSPlanner:
             best_searched.first_value = float(value.item())
 
         # Execution action: a safety mandate overrides the searched preference.
-        if mandate["mandate"] is not None:
+        if mandate["mandate"] in ("stop", "yield"):
             exec_action_np = np.asarray(mandate["clamped_controls"], dtype=np.float32)
             best_searched.maneuver = mandate["mandate"]
+        elif mandate["mandate"] == "stay_in_lane":
+            # Keep the planned action but clamp steering so no lane change happens.
+            exec_action_np = np.asarray(best_searched.actions[0], dtype=np.float32).copy()
+            exec_action_np[0] = float(np.clip(
+                exec_action_np[0], -LANE_CHANGE_STEER_CLAMP, LANE_CHANGE_STEER_CLAMP))
+            best_searched.maneuver = "stay_in_lane"
         else:
             exec_action_np = np.asarray(best_searched.actions[0], dtype=np.float32)
 

@@ -5,7 +5,11 @@ from dataclasses import dataclass
 @dataclass
 class Config:
     # Environment
-    state_dim: int = 28
+    # 48 = ego(6) + lane(4) + traffic(3) + 5 vehicle blocks x 5
+    #      (ahead/behind/left/right/nearest) + 2 VRUs x 5.
+    # (The Tier-1 spec said "42"; that is an arithmetic slip — 28 + 4 new
+    #  5-dim vehicle blocks = 48, which the VRU index constants 38/43 require.)
+    state_dim: int = 48
     action_dim: int = 4
     host: str = "localhost"
     port: int = 2000
@@ -58,6 +62,12 @@ class Config:
     w_safe: float = 1.0
     w_comfort: float = 0.1
     w_rules: float = 0.5
+
+    # General vehicle safety (Tier 1: rear/side traffic awareness)
+    w_vehicle: float = 1.0              # vehicle-safety weight (VRU stays 2.0)
+    rear_risk_threshold: float = 3.0    # seconds TTC for a rear-collision penalty
+    vehicle_proximity_sigma: float = 5.0    # distance scale for proximity penalty
+    min_lane_change_clearance: float = 2.0  # min safe side gap for a lane change
     sigma_d: float = 5.0
     lambda_ttc: float = 0.5
     tau_ttc: float = 2.0

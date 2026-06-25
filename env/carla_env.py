@@ -10,7 +10,52 @@ import numpy as np
 from configs.config import Config
 from rewards.vru_reward import (
     compute_reward, compute_vru_risk_target, ROUTE_PROGRESS, LANE_OFFSET,
+    EGO_X, EGO_Y, EGO_SPEED, EGO_HEADING,
+    VEHICLE_AHEAD_DIST, VEHICLE_BEHIND_DIST, VEHICLE_LEFT_DIST,
+    VEHICLE_RIGHT_DIST, VEHICLE_NEAREST_DIST,
+    VRU1_DIST, VRU2_DIST,
 )
+
+
+def classify_vehicles(ego_x, ego_y, ego_heading, lane_width, vehicles,
+                      default_dist=100.0):
+    """Sort surrounding vehicles into ahead/behind/left/right/nearest blocks.
+
+    ``vehicles`` is a list of dicts with keys ``x, y, speed, heading`` in world
+    coordinates. Each output block is ``[dist, speed, heading, local_x,
+    local_y]`` in the ego frame (local_x>0 ahead, local_y>0 to the left).
+    Missing directions default to a far, stationary placeholder.
+    """
+    default = [default_dist, 0.0, 0.0, 0.0, 0.0]
+    ahead = behind = left = right = nearest = None
+    min_dist = float("inf")
+    cos_h, sin_h = np.cos(-ego_heading), np.sin(-ego_heading)
+    half_lane = max(0.5, float(lane_width) / 2.0)
+
+    for v in vehicles:
+        rel_x, rel_y = float(v["x"]) - ego_x, float(v["y"]) - ego_y
+        local_x = rel_x * cos_h - rel_y * sin_h
+        local_y = rel_x * sin_h + rel_y * cos_h
+        dist = float(np.hypot(local_x, local_y))
+        block = [dist, float(v.get("speed", 0.0)), float(v.get("heading", 0.0)),
+                 local_x, local_y]
+
+        if dist < min_dist:
+            min_dist, nearest = dist, block
+        if local_x > 0 and (ahead is None or dist < ahead[0]):
+            ahead = block
+        elif local_x < 0 and (behind is None or dist < behind[0]):
+            behind = block
+        if local_y > half_lane and (left is None or dist < left[0]):
+            left = block
+        elif local_y < -half_lane and (right is None or dist < right[0]):
+            right = block
+
+    return {
+        "ahead": ahead or default, "behind": behind or default,
+        "left": left or default, "right": right or default,
+        "nearest": nearest or default,
+    }
 
 
 class CarlaEnv:
@@ -131,14 +176,15 @@ class CarlaEnv:
         s[10] = float(self.rng.integers(0, 3))              # light state 0/1/2
         s[11] = self.rng.uniform(0, 50)                     # dist_to_light
         s[12] = self.rng.uniform(0, 1)                      # route_progress
-        # nearest vehicle
-        s[13] = self.rng.uniform(2, 50)                     # dist
-        s[14] = self.rng.uniform(0, 15)                     # speed
-        s[15] = self.rng.uniform(-np.pi, np.pi)             # heading
-        s[16:18] = self.rng.uniform(-30, 30, size=2)        # rel_x, rel_y
-        # VRUs
-        for i in range(2):
-            base = 18 + i * 5
+        # vehicle blocks: ahead[13], behind[18], left[23], right[28], nearest[33]
+        for base in (VEHICLE_AHEAD_DIST, VEHICLE_BEHIND_DIST, VEHICLE_LEFT_DIST,
+                     VEHICLE_RIGHT_DIST, VEHICLE_NEAREST_DIST):
+            s[base] = self.rng.uniform(3, 60)               # dist
+            s[base + 1] = self.rng.uniform(0, 15)           # speed
+            s[base + 2] = self.rng.uniform(-np.pi, np.pi)   # heading
+            s[base + 3:base + 5] = self.rng.uniform(-30, 30, size=2)  # rel_x, rel_y
+        # VRUs at [38..42] and [43..47]
+        for base in (VRU1_DIST, VRU2_DIST):
             s[base] = self.rng.uniform(1, 40)               # dist
             s[base + 1] = self.rng.uniform(0, 3)            # speed
             s[base + 2] = self.rng.uniform(-np.pi, np.pi)   # heading
@@ -154,6 +200,7 @@ class CarlaEnv:
             "prev_action": self._prev_action.copy(),
             "collision": collision,
             "lane_departure": lane_departure,
+            "collision_with_vehicle": bool(self.rng.random() < 0.04),  # 4%
             "red_light_violation": bool(self.rng.random() < 0.03),   # 3%
             "stop_sign_violation": bool(self.rng.random() < 0.02),   # 2%
             "crosswalk_conflict": bool(self.rng.random() < 0.05),    # 5%
@@ -196,8 +243,8 @@ class CarlaEnv:
             }
 
         vru_list = [
-            make("vru0", 18, 19, 20, 21, 22),
-            make("vru1", 23, 24, 25, 26, 27),
+            make("vru0", 38, 39, 40, 41, 42),
+            make("vru1", 43, 44, 45, 46, 47),
         ]
         vehicle_list = [make("veh0", 13, 14, 15, 16, 17)]
         return vru_list, vehicle_list
@@ -331,6 +378,27 @@ class CarlaEnv:
         s[5] = acc.y
         # Remaining fields would be filled from waypoints / actor lists.
         s[7] = 3.5  # nominal lane width
+
+        # Tier-1: sort surrounding vehicles into ahead/behind/left/right/nearest.
+        vehicles = []
+        for actor in self.world.get_actors().filter("vehicle.*"):
+            if actor.id == self.vehicle.id:
+                continue
+            loc = actor.get_location()
+            avel = actor.get_velocity()
+            vehicles.append({
+                "x": loc.x, "y": loc.y,
+                "speed": float(np.linalg.norm([avel.x, avel.y, avel.z])),
+                "heading": np.deg2rad(actor.get_transform().rotation.yaw),
+            })
+        blocks = classify_vehicles(s[EGO_X], s[EGO_Y], s[EGO_HEADING], s[7],
+                                   vehicles)
+        for base, key in ((VEHICLE_AHEAD_DIST, "ahead"),
+                          (VEHICLE_BEHIND_DIST, "behind"),
+                          (VEHICLE_LEFT_DIST, "left"),
+                          (VEHICLE_RIGHT_DIST, "right"),
+                          (VEHICLE_NEAREST_DIST, "nearest")):
+            s[base:base + 5] = blocks[key]
         return s
 
     def _real_info(self, state, action):  # pragma: no cover - requires CARLA
@@ -341,6 +409,7 @@ class CarlaEnv:
             "prev_action": self._prev_action.copy(),
             "collision": collision,
             "lane_departure": lane_departure,
+            "collision_with_vehicle": collision,
             "red_light_violation": False,
             "stop_sign_violation": False,
             "crosswalk_conflict": False,

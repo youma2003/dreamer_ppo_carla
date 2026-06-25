@@ -291,16 +291,17 @@ def train(config=None, mock=False, num_episodes=None, verbose=True, log_dir=None
 # S-DBS training (Serendipitous Diverse Beam Search extension)
 # ---------------------------------------------------------------------- #
 def _build_occupancy_targets(states, grid=16, extent=20.0):
-    """Rasterize nearest-vehicle + VRU relative positions into a BEV occupancy
-    grid target (B, grid, grid) for the scene-reconstruction head.
+    """Rasterize vehicle + VRU relative positions into a BEV occupancy grid
+    target (B, grid, grid) for the scene-reconstruction head.
 
-    Relative-position pairs in the state vector: nearest vehicle (16, 17),
-    VRU0 (21, 22), VRU1 (26, 27).
+    Relative-position (rel_x, rel_y) pairs in the 48-dim state: vehicle ahead
+    (16,17), behind (21,22), left (26,27), right (31,32), nearest (36,37),
+    VRU0 (41,42), VRU1 (46,47).
     """
     states = states.detach().cpu().numpy()
     b = states.shape[0]
     target = np.zeros((b, grid, grid), dtype=np.float32)
-    pairs = [(16, 17), (21, 22), (26, 27)]
+    pairs = [(16, 17), (21, 22), (26, 27), (31, 32), (36, 37), (41, 42), (46, 47)]
     for i in range(b):
         for xi, yi in pairs:
             rx, ry = float(states[i, xi]), float(states[i, yi])

@@ -21,18 +21,27 @@ import numpy as np
 from configs.config import Config
 from rewards.vru_reward import (
     compute_reward, EGO_SPEED, ROUTE_PROGRESS, VRU1_DIST, VRU2_DIST,
+    VEHICLE_AHEAD_DIST, VEHICLE_BEHIND_DIST, VEHICLE_LEFT_DIST, VEHICLE_RIGHT_DIST,
 )
 
 ZERO_ACTION = np.zeros(4, dtype=np.float32)
+_STATE_DIM = Config().state_dim
 
 
 def make_state(route_progress=0.0, ego_speed=0.0, vru_dist=50.0):
-    """Build a dim-28 state with the fields the reward cares about."""
-    s = np.zeros(28, dtype=np.float32)
+    """Build a state with the fields the reward cares about.
+
+    Vehicle blocks default to "far" (100 m) so they add no proximity/rear
+    penalties unless a scenario sets them explicitly.
+    """
+    s = np.zeros(_STATE_DIM, dtype=np.float32)
     s[ROUTE_PROGRESS] = route_progress
     s[EGO_SPEED] = ego_speed
     s[VRU1_DIST] = vru_dist
     s[VRU2_DIST] = vru_dist
+    for idx in (VEHICLE_AHEAD_DIST, VEHICLE_BEHIND_DIST,
+                VEHICLE_LEFT_DIST, VEHICLE_RIGHT_DIST):
+        s[idx] = 100.0
     return s
 
 

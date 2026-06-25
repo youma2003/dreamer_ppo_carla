@@ -313,6 +313,60 @@ def test_dreamer_ppo_with_prediction(config):
     ok("dreamer_ppo_with_prediction", "2 episodes complete")
 
 
+def test_dreamer_ppo_tier1_safety(config):
+    from configs.sdbs_config import SDBSConfig
+    from training.dreamer_ppo import train_sdbs
+    from env.carla_env import CarlaEnv
+    from models.actor_critic import ActorCritic
+    from models.world_model import WorldModel
+    from planning.sdbs_planner import SDBSPlanner, LANE_CHANGE_STEER_CLAMP
+    from rewards.vru_reward import VEHICLE_RIGHT_DIST, VEHICLE_AHEAD_DIST, EGO_SPEED
+
+    small = SDBSConfig()
+    assert small.state_dim == 48
+    small.rollout_size = 128
+    small.update_epochs = 1
+    small.batch_size = 64
+    small.max_episode_steps = 20
+    small.wm_warmup_steps = 0
+    small.wm_batch_size = 64
+    small.beam_width_max = 6
+    small.horizon_max = 2
+    small.num_groups_max = 2
+    small.compute_budget = 30
+    small.scenarios_per_stage = 2
+    small.max_scenarios_per_episode = 2
+    small.collect_prediction_data = False
+    history = train_sdbs(small, mock=True, num_episodes=2, verbose=False,
+                         log_dir=None, ckpt_dir=None)
+    assert len(history) == 2
+
+    # Vehicle reward components are produced by the env each step.
+    env = CarlaEnv(mock=True, config=small)
+    env.reset()
+    _obs, _r, _done, info = env.step(np.zeros(small.action_dim, dtype=np.float32))
+    comps = info["reward_components"]
+    for key in ("vehicle_collision", "vehicle_proximity", "rear_risk"):
+        assert key in comps, key
+    env.close()
+
+    # A lane-change mandate triggers when the side is blocked.
+    policy = ActorCritic(small.state_dim, small.action_dim, small.hidden)
+    wm = WorldModel(small.state_dim, small.action_dim, small.wm_hidden)
+    planner = SDBSPlanner(policy, wm, policy, small)
+    state = np.zeros(small.state_dim, dtype=np.float32)
+    state[7] = 3.5
+    state[10] = 2.0          # green light
+    state[11] = 50.0
+    state[VEHICLE_AHEAD_DIST] = 100.0
+    state[VEHICLE_RIGHT_DIST] = 1.5
+    state[EGO_SPEED] = 5.0
+    action, _plan, meta = planner.plan(state, {"requested_action_steering": 0.6})
+    assert meta["mandate"] == "stay_in_lane"
+    assert abs(float(action[0])) <= LANE_CHANGE_STEER_CLAMP + 1e-6
+    ok("dreamer_ppo_tier1_safety", "2 episodes with new state/rewards")
+
+
 def main():
     config = Config()
     print("Running Dreamer-PPO mock pipeline tests (no CARLA needed)...\n")
@@ -331,6 +385,7 @@ def main():
     test_dreamer_ppo_full(config)
     test_full_sdbs_loop(config)
     test_dreamer_ppo_with_prediction(config)
+    test_dreamer_ppo_tier1_safety(config)
     print("\n✅ ALL TESTS PASSED")
 
 

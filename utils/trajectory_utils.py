@@ -6,20 +6,22 @@ triples by reading each VRU/vehicle slot out of the flat state vector and
 forming sliding history->future windows; ``evaluate_prediction_accuracy``
 reports ADE / FDE / success-rate.
 
-State-vector layout (dim=28, see env/carla_env.py):
-  ego (x, y) at 0, 1; nearest vehicle (speed, heading, rel_x, rel_y) at
-  14, 15, 16, 17; VRU0 (dist, speed, heading, rel_x, rel_y) at 18..22;
-  VRU1 at 23..27. Absolute agent position = ego position + relative offset.
+State-vector layout (dim=48, see env/carla_env.py): ego (x, y) at 0, 1; each
+agent block is (dist, speed, heading, rel_x, rel_y). Absolute agent position =
+ego position + relative offset.
 """
 import numpy as np
 import torch
 
 
-# Agent slots: (relative_x_index, relative_y_index, speed_index, heading_index, class)
+# Agent slots: (rel_x_index, rel_y_index, speed_index, heading_index, class)
 _AGENT_SLOTS = [
-    (21, 22, 19, 20, 0),    # VRU0  -> pedestrian/cyclist (class 0)
-    (26, 27, 24, 25, 0),    # VRU1  -> pedestrian/cyclist (class 0)
-    (16, 17, 14, 15, 2),    # nearest vehicle (class 2)
+    (41, 42, 39, 40, 0),    # VRU0           -> pedestrian/cyclist (class 0)
+    (46, 47, 44, 45, 0),    # VRU1           -> pedestrian/cyclist (class 0)
+    (16, 17, 14, 15, 2),    # vehicle ahead  (class 2)
+    (21, 22, 19, 20, 2),    # vehicle behind (class 2)
+    (26, 27, 24, 25, 2),    # vehicle left   (class 2)
+    (31, 32, 29, 30, 2),    # vehicle right  (class 2)
 ]
 
 

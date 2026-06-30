@@ -109,7 +109,8 @@ def _save_checkpoint(path, episode, policy, world_model, optimizer_pi, eval_retu
 # Training
 # ---------------------------------------------------------------------- #
 def train(config=None, mock=False, num_episodes=None, verbose=True, log_dir=None,
-          device="cpu", eval_interval=50, ckpt_dir="checkpoints"):
+          device="cpu", eval_interval=50, ckpt_dir="checkpoints",
+          log_name="training_log.csv"):
     config = config or Config()
     if num_episodes is not None:
         config.num_episodes = num_episodes
@@ -130,7 +131,7 @@ def train(config=None, mock=False, num_episodes=None, verbose=True, log_dir=None
     wm_trainer = WorldModelTrainer(world_model, config)
     evaluator = Evaluator(env, policy, world_model, config, device=device)
 
-    logger = Logger(log_dir) if log_dir else None
+    logger = Logger(log_dir, log_name) if log_dir else None
     if ckpt_dir:
         os.makedirs(ckpt_dir, exist_ok=True)
     best_eval_return = -float("inf")
@@ -313,7 +314,8 @@ def _build_occupancy_targets(states, grid=16, extent=20.0):
 
 
 def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
-               log_dir=None, device="cpu", ckpt_dir="checkpoints"):
+               log_dir=None, device="cpu", ckpt_dir="checkpoints",
+               log_name="training_log.csv"):
     """Dreamer-PPO with S-DBS planning, risk-aware curriculum, and grounding.
 
     Replaces greedy one-step dreaming with multi-step diverse beam search,
@@ -398,7 +400,7 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
         lr=config.lr_wm,
     )
 
-    logger = Logger(log_dir) if log_dir else None
+    logger = Logger(log_dir, log_name) if log_dir else None
     if ckpt_dir:
         os.makedirs(ckpt_dir, exist_ok=True)
     best_eval_return = -float("inf")
@@ -666,18 +668,39 @@ def main():
                         help="run without CARLA installed")
     parser.add_argument("--sdbs", action="store_true",
                         help="use the S-DBS planner + risk-aware curriculum")
+    parser.add_argument("--baseline", action="store_true",
+                        help="run the PPO baseline (no world model / no dreaming)")
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--log-name", default=None,
+                        help="CSV filename under logs/ (default: per-variant name "
+                             "so variants don't overwrite each other)")
     args = parser.parse_args()
 
-    if args.sdbs:
+    if args.sdbs and args.baseline:
+        parser.error("--sdbs and --baseline are mutually exclusive")
+
+    # Each variant gets its own log file by default, so a full sweep
+    # (baseline -> dreamer -> sdbs) leaves three CSVs ready for
+    # scripts/compare_dreamers.py.
+    variant = "sdbs" if args.sdbs else "baseline" if args.baseline else "dreamer"
+    log_name = args.log_name or f"{variant}.csv"
+
+    if args.baseline:
+        from training.ppo_baseline import train_baseline
+        train_baseline(Config(), mock=args.mock, num_episodes=args.episodes,
+                       log_dir="logs", log_name=log_name)
+    elif args.sdbs:
         from configs.sdbs_config import SDBSConfig
         train_sdbs(SDBSConfig(), mock=args.mock, num_episodes=args.episodes,
-                   device=args.device, log_dir="logs", ckpt_dir="checkpoints")
+                   device=args.device, log_dir="logs", ckpt_dir="checkpoints",
+                   log_name=log_name)
     else:
         config = Config()
         train(config, mock=args.mock, num_episodes=args.episodes,
-              device=args.device, log_dir="logs", ckpt_dir="checkpoints")
+              device=args.device, log_dir="logs", ckpt_dir="checkpoints",
+              log_name=log_name)
+    print(f"\nLog written to logs/{log_name}")
 
 
 if __name__ == "__main__":

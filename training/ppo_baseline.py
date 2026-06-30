@@ -53,7 +53,7 @@ def select_action(policy, state):
 # Training
 # ---------------------------------------------------------------------- #
 def train_baseline(config=None, mock=False, num_episodes=None, verbose=True,
-                   log_dir=None):
+                   log_dir=None, log_name="training_log.csv"):
     config = config or Config()
     if num_episodes is not None:
         config.num_episodes = num_episodes
@@ -72,7 +72,7 @@ def train_baseline(config=None, mock=False, num_episodes=None, verbose=True,
                                  action_dim=config.action_dim)
     wm_trainer = WorldModelTrainer(world_model, config)
 
-    logger = Logger(log_dir) if log_dir else None
+    logger = Logger(log_dir, log_name) if log_dir else None
     history = []
     try:
         for episode in range(config.num_episodes):

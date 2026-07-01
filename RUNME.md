@@ -14,7 +14,7 @@ There are three variants (each writes its **own** CSV under `logs/`):
 | Dreamer-PPO        | *(none)*     | world model + greedy one-step dreaming          |
 | SDBS Dreamer-PPO   | `--sdbs`     | full version: diverse beam search + curriculum  |
 
----
+----
 
 ## 0. One-time check (no CARLA needed)
 

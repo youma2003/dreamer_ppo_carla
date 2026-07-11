@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 
+from env.carla_env import validate_state_vector
+
 
 class ActorCritic(nn.Module):
     def __init__(self, state_dim=28, action_dim=4, hidden=256):
@@ -40,6 +42,7 @@ class ActorCritic(nn.Module):
         return torch.cat([steering, rest], dim=-1)
 
     def forward(self, state):
+        validate_state_vector(state, self.state_dim)
         h = self.trunk(state)
         mean = self.actor_mean(h)
         std = torch.exp(self.log_std).expand_as(mean)
@@ -51,6 +54,7 @@ class ActorCritic(nn.Module):
 
         Returns (bounded_action, log_prob, value), all detached.
         """
+        validate_state_vector(state, self.state_dim)
         mean, std, value = self.forward(state)
         dist = Normal(mean, std)
         raw_action = dist.sample()

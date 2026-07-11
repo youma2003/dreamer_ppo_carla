@@ -3,8 +3,6 @@
 In mock mode no `carla` import is attempted, so every component of the
 project can be developed and tested locally without CARLA installed.
 """
-from collections import deque
-
 import numpy as np
 
 from configs.config import Config
@@ -15,6 +13,48 @@ from rewards.vru_reward import (
     VEHICLE_RIGHT_DIST, VEHICLE_NEAREST_DIST,
     VRU1_DIST, VRU2_DIST,
 )
+
+
+# ---------------------------------------------------------------------- #
+# State-vector contract (single source of truth)
+# ---------------------------------------------------------------------- #
+# ``STATE_DIM`` is the full augmented state consumed by the policy in the
+# S-DBS path: 48 base env features + 7 map-agnostic features. The base env
+# itself emits ``config.state_dim`` (48 by default); the map-agnostic wrapper
+# appends the final 7. Update this table if the layout ever changes.
+STATE_DIM = 55
+STATE_LAYOUT = {
+    'ego': (0, 6),
+    'lane': (6, 10),
+    'traffic': (10, 13),
+    'vehicle_ahead': (13, 18),
+    'vehicle_behind': (18, 23),
+    'vehicle_left': (23, 28),
+    'vehicle_right': (28, 33),
+    'vehicle_nearest': (33, 38),
+    'vru': (38, 48),
+    'map_agnostic': (48, 55),
+}
+
+
+def validate_state_vector(state, expected_dim=STATE_DIM):
+    """Raise immediately if the state shape doesn't match ``expected_dim``.
+
+    Never silently pad, truncate, or reshape — a wrong dimension almost always
+    means the state-building code and the trained checkpoint disagree, which
+    silently produces garbage. ``expected_dim`` defaults to the full augmented
+    contract (``STATE_DIM``); callers that operate on the base env state pass
+    their own configured dimension so the check fires on true mismatches
+    without conflating the base (48) and augmented (55) layouts.
+    """
+    dim = state.shape[-1]
+    if dim != expected_dim:
+        raise ValueError(
+            f"State vector has {dim} dims, expected {expected_dim}. "
+            f"Layout (full augmented state): {STATE_LAYOUT}. "
+            f"This usually means the state-building code and the trained "
+            f"checkpoint disagree on dimensions."
+        )
 
 
 def classify_vehicles(ego_x, ego_y, ego_heading, lane_width, vehicles,
@@ -82,12 +122,6 @@ class CarlaEnv:
         self._state = None
         self._prev_action = np.zeros(self.action_dim, dtype=np.float32)
         self._scenario_id = None        # set by reset_to_scenario (S-DBS curriculum)
-
-        # Multi-agent trajectory tracking (for the traffic predictor).
-        self.history_length = 5
-        self.vru_history = {}           # vru_id -> deque of (x, y, vx, vy, class)
-        self.vehicle_history = {}       # vehicle_id -> deque of (x, y, vx, vy, class)
-        self.collected_trajectories = []
 
         # CARLA handles (real mode only).
         self.client = None
@@ -216,43 +250,12 @@ class CarlaEnv:
             "lane_departures": int(lane_departure),
         }
         info["vru_risk"] = compute_vru_risk_target(state, info, self.config)
-        info["vru_list"], info["vehicle_list"] = self._build_agent_lists(state)
         info.update(self._compute_safety_lists(state))
         return info
 
     # ------------------------------------------------------------------ #
-    # Multi-agent tracking
+    # Per-step safety signals
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def _build_agent_lists(state):
-        """Derive per-agent observations (absolute pos + velocity) from a state.
-
-        Returns ``(vru_list, vehicle_list)`` — lists of dicts with keys
-        ``id, x, y, vx, vy``. Velocity is reconstructed from the per-agent
-        speed/heading fields; absolute position from ego pos + relative offset.
-        """
-        s = np.asarray(state, dtype=np.float32)
-        ego_x, ego_y = float(s[0]), float(s[1])
-
-        def make(agent_id, dist_i, speed_i, head_i, relx_i, rely_i):
-            speed = float(s[speed_i])
-            heading = float(s[head_i])
-            return {
-                "id": agent_id,
-                "x": ego_x + float(s[relx_i]),
-                "y": ego_y + float(s[rely_i]),
-                "vx": speed * np.cos(heading),
-                "vy": speed * np.sin(heading),
-                "distance": float(s[dist_i]),
-            }
-
-        vru_list = [
-            make("vru0", 38, 39, 40, 41, 42),
-            make("vru1", 43, 44, 45, 46, 47),
-        ]
-        vehicle_list = [make("veh0", 13, 14, 15, 16, 17)]
-        return vru_list, vehicle_list
-
     @staticmethod
     def _compute_safety_lists(state):
         """Per-step TTC / distance lists for VRUs and vehicles (for tracking).
@@ -299,40 +302,16 @@ class CarlaEnv:
             "vehicle_directions": veh_dirs,
         }
 
-    def _track_agents(self, info):
-        """Append the current agent observations to the rolling histories."""
-        for vru in info.get("vru_list", []):
-            hist = self.vru_history.setdefault(
-                vru["id"], deque(maxlen=self.history_length))
-            hist.append((vru["x"], vru["y"], vru["vx"], vru["vy"], 0))   # 0=ped
-        for veh in info.get("vehicle_list", []):
-            hist = self.vehicle_history.setdefault(
-                veh["id"], deque(maxlen=self.history_length))
-            hist.append((veh["x"], veh["y"], veh["vx"], veh["vy"], 2))   # 2=vehicle
-
-    def get_agent_histories(self):
-        """Dict ``agent_id -> history array (history_length, 5)`` (left-padded)."""
-        out = {}
-        for agent_id, hist in {**self.vru_history, **self.vehicle_history}.items():
-            if not hist:
-                continue
-            rows = list(hist)
-            while len(rows) < self.history_length:
-                rows.insert(0, rows[0])
-            out[agent_id] = np.asarray(rows[-self.history_length:], dtype=np.float32)
-        return out
-
     # ------------------------------------------------------------------ #
     # Gym-style API
     # ------------------------------------------------------------------ #
     def reset(self):
         self._step_count = 0
         self._prev_action = np.zeros(self.action_dim, dtype=np.float32)
-        self.vru_history.clear()
-        self.vehicle_history.clear()
 
         if self.mock:
             self._state = self._random_state()
+            validate_state_vector(self._state, self.state_dim)
             return self._state.copy()
 
         # Real mode.  # pragma: no cover - requires CARLA
@@ -340,6 +319,7 @@ class CarlaEnv:
         for _ in range(self.config.fps):
             self.world.tick()
         self._state = self._observe()
+        validate_state_vector(self._state, self.state_dim)
         return self._state.copy()
 
     def reset_to_scenario(self, scenario_id):
@@ -368,7 +348,6 @@ class CarlaEnv:
                 info, self.config,
             )
             info["reward_components"] = components
-            self._track_agents(info)
             self._step_count += 1
             done = bool(
                 info["collision"]
@@ -377,6 +356,7 @@ class CarlaEnv:
             )
             self._prev_action = action.copy()
             self._state = next_state
+            validate_state_vector(next_state, self.state_dim)
             return next_state.copy(), reward, done, info
 
         # Real mode.  # pragma: no cover - requires CARLA
@@ -389,7 +369,6 @@ class CarlaEnv:
             info, self.config,
         )
         info["reward_components"] = components
-        self._track_agents(info)
         self._step_count += 1
         done = bool(
             self._collision_flag
@@ -398,6 +377,7 @@ class CarlaEnv:
         )
         self._prev_action = action.copy()
         self._state = next_state
+        validate_state_vector(next_state, self.state_dim)
         return next_state.copy(), reward, done, info
 
     # ------------------------------------------------------------------ #
@@ -470,7 +450,6 @@ class CarlaEnv:
             "lane_departures": int(lane_departure),
         }
         info["vru_risk"] = compute_vru_risk_target(state, info, self.config)
-        info["vru_list"], info["vehicle_list"] = self._build_agent_lists(state)
         info.update(self._compute_safety_lists(state))
         return info
 

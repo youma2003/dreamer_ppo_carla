@@ -22,16 +22,16 @@ import time
 import numpy as np
 import torch
 
-from rewards.vru_reward import EGO_X, EGO_Y, EGO_SPEED, VRU_DIST_INDICES
+from rewards.vru_reward import EGO_SPEED, VRU_DIST_INDICES
 from env.carla_env import (
     VEHICLE_AHEAD_DIST, VEHICLE_BEHIND_DIST, VEHICLE_LEFT_DIST, VEHICLE_RIGHT_DIST,
+    validate_state_vector,
 )
 from planning.sdbs_core import (
     Plan, BeamState, compute_conflict_cells, jaccard_diversity,
 )
 from planning.defensive_driving import DefensiveDrivingController
 from planning.lane_change_explainer import LaneChangeExplainer
-from models.traffic_predictor import compute_collision_risk
 
 # State indices not re-exported by the reward module.
 TRAFFIC_LIGHT_STATE = 10
@@ -41,16 +41,13 @@ LANE_CHANGE_STEER_CLAMP = 0.2       # clamp steering to +-this when staying in l
 
 
 class SDBSPlanner:
-    def __init__(self, policy, world_model, critic, config,
-                 traffic_predictor=None, device="cpu"):
+    def __init__(self, policy, world_model, critic, config, device="cpu"):
         self.policy = policy
         self.world_model = world_model
         self.critic = critic if critic is not None else policy
         self.config = config
-        self.traffic_predictor = traffic_predictor
         self.device = torch.device(device)
         self.beam = None        # most recent BeamState (handy for inspection/tests)
-        self._agent_predictions = {}   # cached per plan() call
         self.defensive_controller = DefensiveDrivingController(config)
         self.explainer = LaneChangeExplainer()
 
@@ -115,8 +112,19 @@ class SDBSPlanner:
         return float(1.0 / (1.0 + math.exp(-(z - 1.0))))
 
     def get_search_params(self, difficulty):
-        """Scale (beam width B, horizon H, groups G) by difficulty in [0, 1]."""
+        """Scale (beam width B, horizon H, groups G) by difficulty in [0, 1].
+
+        When ``config.sdbs_force_fixed_params`` is set, difficulty-based scaling
+        is bypassed and the fixed (beam_width, horizon, groups) from config are
+        returned. This lets an integration start at horizon=1, groups=1 —
+        behaviourally equivalent to greedy one-step dreaming — and increase the
+        horizon gradually to isolate exactly where degradation starts.
+        """
         cfg = self.config
+        if getattr(cfg, "sdbs_force_fixed_params", False):
+            return (cfg.sdbs_fixed_beam_width,
+                    cfg.sdbs_fixed_horizon,
+                    cfg.sdbs_fixed_groups)
         d = float(np.clip(difficulty, 0.0, 1.0))
         B = int(round(cfg.beam_width_min + d * (cfg.beam_width_max - cfg.beam_width_min)))
         H = int(round(cfg.horizon_min + d * (cfg.horizon_max - cfg.horizon_min)))
@@ -221,40 +229,6 @@ class SDBSPlanner:
             cur = torch.as_tensor(ns, device=self.device)
         return traj[-1], rewards, traj
 
-    # ------------------------------------------------------------------ #
-    # Multi-agent prediction
-    # ------------------------------------------------------------------ #
-    @torch.no_grad()
-    def _predict_agent_futures(self, state, info, horizon):
-        """Predict near-future trajectories of every tracked VRU/vehicle.
-
-        Returns ``dict agent_id -> (predicted_traj (H, 2), uncertainty (H, 2))``.
-        Empty when no predictor or no agent histories are available (e.g. mock
-        runs before tracking warms up), in which case planning falls back to
-        treating agents as static.
-        """
-        if self.traffic_predictor is None:
-            return {}
-        histories = (info or {}).get("agent_histories")
-        if not histories:
-            return {}
-
-        predictions = {}
-        for agent_id, hist in histories.items():
-            hist = np.asarray(hist, dtype=np.float32)
-            traj = self.traffic_predictor.predict_single(hist, n_steps=horizon)
-            predictions[agent_id] = (traj, None)
-        return predictions
-
-    def _plan_collision_risk(self, plan):
-        """Collision risk between a plan's imagined ego path and predictions."""
-        if not self._agent_predictions or len(plan.imagined_states) < 2:
-            return 0.0
-        ego_traj = np.asarray(
-            [[float(s[EGO_X]), float(s[EGO_Y])]
-             for s in plan.imagined_states[1:]], dtype=np.float32)
-        return compute_collision_risk(ego_traj, self._agent_predictions)
-
     def _value(self, state_np):
         st = torch.as_tensor(np.asarray(state_np, dtype=np.float32),
                              device=self.device)
@@ -275,22 +249,14 @@ class SDBSPlanner:
     # Scoring
     # ------------------------------------------------------------------ #
     def _score_plan(self, plan, group_id, all_groups, beam):
-        """Composite score: exploitation for group 0, serendipity for the rest.
-
-        All groups are additionally penalised by the predicted multi-agent
-        collision risk so plans that drive into a forecast pedestrian/cyclist
-        path score lower regardless of their imagined return.
-        """
+        """Composite score: exploitation for group 0, serendipity for the rest."""
         plan.g_value = self._g_value(plan)
         g_value = plan.g_value
         cfg = self.config
 
-        plan.collision_risk = self._plan_collision_risk(plan)
-        collision_term = cfg.lambda_collision * plan.collision_risk
-
         if group_id == 0:
             plan.serendipity_value = 0.0
-            return g_value - collision_term
+            return g_value
 
         my_cells = beam.conflict_cells.get(plan)
         if my_cells is None:
@@ -328,8 +294,7 @@ class SDBSPlanner:
 
         return (g_value
                 + cfg.eta_serendipity * serendipity
-                - cfg.lambda_g * diversity_penalty
-                - collision_term)
+                - cfg.lambda_g * diversity_penalty)
 
     # ------------------------------------------------------------------ #
     # Main entry point
@@ -337,6 +302,7 @@ class SDBSPlanner:
     @torch.no_grad()
     def plan(self, state, info=None, compute_budget=None):
         """Run S-DBS. Returns (best_action_tensor, best_plan, metadata)."""
+        validate_state_vector(state, self.policy.state_dim)
         t0 = time.perf_counter()
         info = info or {}
         if compute_budget is None:
@@ -357,9 +323,6 @@ class SDBSPlanner:
             info["requested_action_steering"] = float(
                 torch.tanh(mean.reshape(-1)[0]).item())
         mandate = self.evaluate_mandated_safety(state_np, info)
-
-        # Predict every tracked agent's future once; scoring reuses it per plan.
-        self._agent_predictions = self._predict_agent_futures(state_np, info, H)
 
         beam = BeamState(depth=0, num_groups=G)
         for g in range(G):
@@ -504,8 +467,6 @@ class SDBSPlanner:
             ),
             "serendipity_bonus_used": serendipity_used,
             "serendipity_score": float(best_searched.serendipity_value),
-            "collision_risk": float(best_searched.collision_risk),
-            "predicted_agents": len(self._agent_predictions),
             "defensive_mode": self.defensive_controller.defensive_mode_active,
             "planning_latency_ms": (time.perf_counter() - t0) * 1000.0,
             "latency_ms": (time.perf_counter() - t0) * 1000.0,

@@ -22,6 +22,7 @@ from training.ppo import update_ppo
 from training.logger import Logger
 from training.wm_buffer import WorldModelBuffer
 from training.world_model_trainer import WorldModelTrainer
+from utils.progress_monitor import ProgressMonitor
 from rewards.vru_reward import ROUTE_PROGRESS
 
 
@@ -73,6 +74,12 @@ def train_baseline(config=None, mock=False, num_episodes=None, verbose=True,
     wm_trainer = WorldModelTrainer(world_model, config)
 
     logger = Logger(log_dir, log_name) if log_dir else None
+
+    # Flags a route_progress signal that never advances (env/reward wiring bug)
+    # rather than letting it masquerade as poor policy performance.
+    progress_monitor = ProgressMonitor()
+    global_step = 0
+
     history = []
     try:
         for episode in range(config.num_episodes):
@@ -104,6 +111,8 @@ def train_baseline(config=None, mock=False, num_episodes=None, verbose=True,
                 for key in ep_components:
                     ep_components[key] += float(comp.get(key, 0.0))
                 route_completion = float(next_obs[ROUTE_PROGRESS])
+                progress_monitor.record(global_step, route_completion)
+                global_step += 1
                 obs = next_obs
 
                 if done:
@@ -170,6 +179,11 @@ def train_baseline(config=None, mock=False, num_episodes=None, verbose=True,
                     f"ppo_loss={stats.get('loss', 0.0):.4f} | "
                     f"vru_collisions={ep_collisions}"
                 )
+
+            if episode % 50 == 0:
+                stall_check = progress_monitor.check_stalled()
+                if stall_check["stalled"]:
+                    print(f"WARNING: {stall_check['reason']}")
     finally:
         env.close()
         if logger is not None:

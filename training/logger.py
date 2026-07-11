@@ -28,7 +28,7 @@ class Logger:
         "r_comfort", "r_rules",
         # --- planning / losses ---
         "ppo_loss", "vf_loss", "entropy",
-        "loss_wm", "wm_state_err", "wm_risk_err", "tp_loss",
+        "loss_wm", "wm_state_err", "wm_risk_err",
         "dreaming_active", "dreaming_steps", "defensive_mode_active",
         "avg_planning_latency_ms", "state_dim",
         # --- general ---

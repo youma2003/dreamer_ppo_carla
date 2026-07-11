@@ -43,19 +43,6 @@ class Config:
     w_risk: float = 2.0
     w_value: float = 0.5
 
-    # Traffic prediction
-    predict_horizon: int = 8           # predict 8 steps (0.8 s at 10 Hz) ahead
-    tp_batch_size: int = 128
-    lr_tp: float = 1e-3                # learning rate for the predictor
-    tp_hidden_dim: int = 128
-    collect_prediction_data: bool = True   # collect data in a first phase
-    tp_collect_episodes: int = 100     # episodes of trajectory data to pre-collect
-    tp_min_ready: int = 1000           # trajectories needed before predictor is used
-
-    # Prediction weighting in planning
-    lambda_collision: float = 1.0      # weight of predicted-collision risk in scoring
-    prediction_threshold: float = 0.1  # uncertainty threshold for caution
-
     # Reward weights
     w_prog: float = 1.0
     w_vru: float = 2.0
@@ -81,7 +68,6 @@ class Config:
     unknown_map_detection: str = "manual"    # 'manual' or 'gps_comparison'
     defensive_w_vru_mult: float = 1.5        # increase VRU weight
     defensive_w_vehicle_mult: float = 1.5    # increase vehicle-safety weight
-    defensive_lambda_collision_mult: float = 2.0   # harsher collision penalty
     defensive_dream_k: int = 8               # more candidate actions
     defensive_horizon_max: int = 5           # deeper lookahead
     defensive_disable_risky_maneuvers: bool = True
@@ -91,3 +77,14 @@ class Config:
     lambda_cross: float = 1.0
     eta1: float = 0.5  # lane departure weight in safety term
     eta2: float = 0.3  # general risk weight in safety term
+
+    # S-DBS incremental-testing overrides.
+    # When sdbs_force_fixed_params is True, SDBSPlanner.get_search_params
+    # ignores difficulty-based auto-scaling and returns the fixed values below.
+    # Start any new integration at horizon=1, groups=1 (equivalent to greedy
+    # one-step dreaming), confirm it matches the plain dreamer variant, then
+    # increase the horizon gradually to isolate where behaviour degrades.
+    sdbs_force_fixed_params: bool = False
+    sdbs_fixed_horizon: int = 1
+    sdbs_fixed_groups: int = 1
+    sdbs_fixed_beam_width: int = 4

@@ -24,6 +24,7 @@ from training.logger import Logger
 from training.wm_buffer import WorldModelBuffer
 from training.world_model_trainer import WorldModelTrainer
 from training.evaluator import Evaluator
+from utils.progress_monitor import ProgressMonitor
 from rewards.vru_reward import ROUTE_PROGRESS
 
 
@@ -136,6 +137,11 @@ def train(config=None, mock=False, num_episodes=None, verbose=True, log_dir=None
         os.makedirs(ckpt_dir, exist_ok=True)
     best_eval_return = -float("inf")
 
+    # Flags a route_progress signal that never advances (env/reward wiring bug)
+    # rather than letting it masquerade as poor policy performance.
+    progress_monitor = ProgressMonitor()
+    global_step = 0
+
     history = []
     try:
         for episode in range(config.num_episodes):
@@ -173,6 +179,8 @@ def train(config=None, mock=False, num_episodes=None, verbose=True, log_dir=None
                 ep_collisions += int(info.get("vru_collisions", 0))
                 ep_lane_departures += int(info.get("lane_departures", 0))
                 route_completion = float(next_obs[ROUTE_PROGRESS])
+                progress_monitor.record(global_step, route_completion)
+                global_step += 1
                 obs = next_obs
 
                 if done:
@@ -280,6 +288,11 @@ def train(config=None, mock=False, num_episodes=None, verbose=True, log_dir=None
             history.append(record)
             if logger is not None:
                 logger.log(episode, record)
+
+            if episode % 50 == 0:
+                stall_check = progress_monitor.check_stalled()
+                if stall_check["stalled"]:
+                    print(f"WARNING: {stall_check['reason']}")
     finally:
         env.close()
         if logger is not None:
@@ -329,8 +342,6 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
     from models.auxiliary_heads import (
         SceneReconstructionHead, RiskDensityHead, WorldModelEnsemble,
     )
-    from models.traffic_predictor import TrafficPredictor
-    from training.traffic_prediction_trainer import TrafficPredictionTrainer
     from training.map_agnostic_state import MapAgnosticStateWrapper
     from utils.safety_tracker import SafetyTracker
 
@@ -366,21 +377,7 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
                                  action_dim=config.action_dim)
     wm_trainer = WorldModelTrainer(world_model, config)
 
-    # Traffic / pedestrian trajectory predictor (agents are no longer static).
-    traffic_predictor = TrafficPredictor(
-        config.state_dim, horizon=config.predict_horizon,
-        hidden_dim=config.tp_hidden_dim, device=device)
-    tp_trainer = TrafficPredictionTrainer(traffic_predictor, config, device=device)
-    if config.collect_prediction_data:
-        if verbose:
-            print("Collecting trajectory data for prediction training...")
-        tp_trainer.collect_trajectories(
-            env, num_episodes=config.tp_collect_episodes)
-        if verbose:
-            print(f"Collected {len(tp_trainer.trajectory_buffer)} trajectories")
-
-    sdbs_planner = SDBSPlanner(policy, world_model, policy, config,
-                               traffic_predictor=traffic_predictor, device=device)
+    sdbs_planner = SDBSPlanner(policy, world_model, policy, config, device=device)
     # Tier-2: enter defensive mode up front (e.g. unknown map / manual request).
     if config.defensive_mode:
         sdbs_planner.defensive_controller.activate_defensive_mode()
@@ -424,11 +421,10 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
             ep_completion = 0.0
             ep_latency_sum = 0.0
             ep_reward_components = defaultdict(float)
-            last_meta = {"latency_ms": 0.0, "difficulty": 0.0, "collision_risk": 0.0}
+            last_meta = {"latency_ms": 0.0, "difficulty": 0.0}
             ppo_stats, wm_stats = {}, {"loss_wm": 0.0}
             aux_loss_val = 0.0
             wm_ens_loss_val = 0.0
-            tp_stats, tp_eval = {}, {}
 
             for scenario_id in scenario_ids:
                 buffer.clear()
@@ -437,10 +433,6 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
 
                 while not buffer.is_full():
                     state = torch.as_tensor(obs, dtype=torch.float32, device=device)
-                    # Feed tracked agent histories so S-DBS plans against
-                    # predicted (not static) VRU/vehicle futures.
-                    if tp_trainer.is_ready():
-                        info["agent_histories"] = env.get_agent_histories()
                     best_action, plan, meta = sdbs_planner.plan(state, info)
                     last_meta = meta
                     ep_planning_steps += 1
@@ -571,25 +563,12 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
                         print(f"CURRICULUM: Advanced to stage "
                               f"{curriculum.current_stage()}")
 
-            # ---- traffic-predictor update (once collection is ready) ---- #
-            if tp_trainer.is_ready():
-                tp_batch = tp_trainer.trajectory_buffer.get_batch(config.tp_batch_size)
-                tp_stats = tp_trainer.update(tp_batch)
-                if episode % 50 == 0:
-                    tp_eval = tp_trainer.evaluate(tp_batch)
-                    if verbose:
-                        print(f"  TP eval | ADE={tp_eval['ade']:.3f} "
-                              f"FDE={tp_eval['fde']:.3f} "
-                              f"success_rate={tp_eval['success_rate']:.2%}")
-
             defensive_on = sdbs_planner.defensive_controller.defensive_mode_active
             if verbose:
                 print(f"Episode {episode:04d} | stage={curriculum.current_stage()} | "
                       f"state_dim={obs_dim} | "
                       f"defensive={'ON' if defensive_on else 'OFF'} | "
                       f"return={ep_return:.2f} | difficulty={last_meta['difficulty']:.2f} "
-                      f"| collision_risk={last_meta.get('collision_risk', 0.0):.2f} "
-                      f"| tp_loss={tp_stats.get('loss', 0.0):.4f} "
                       f"| planning_latency={last_meta['latency_ms']:.1f}ms | "
                       f"vru_collisions={ep_collisions}")
 
@@ -611,14 +590,9 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
                 "route_completion": ep_completion,
                 "stage": curriculum.current_stage(),
                 "difficulty": last_meta.get("difficulty", 0.0),
-                "collision_risk": last_meta.get("collision_risk", 0.0),
                 "state_dim": obs_dim,
                 "defensive_mode": int(defensive_on),
                 "defensive_mode_active": int(defensive_on),
-                "tp_loss": tp_stats.get("loss", 0.0),
-                "tp_ade": tp_eval.get("ade", tp_stats.get("ade", 0.0)),
-                "tp_fde": tp_eval.get("fde", tp_stats.get("fde", 0.0)),
-                "tp_success_rate": tp_eval.get("success_rate", 0.0),
                 "planning_latency_ms": last_meta.get("latency_ms", 0.0),
                 "avg_planning_latency_ms": avg_latency,
                 # Tier-3 reward components + separated safety metrics.
@@ -681,8 +655,8 @@ def main():
         parser.error("--sdbs and --baseline are mutually exclusive")
 
     # Each variant gets its own log file by default, so a full sweep
-    # (baseline -> dreamer -> sdbs) leaves three CSVs ready for
-    # scripts/compare_dreamers.py.
+    # (baseline -> dreamer -> sdbs) leaves three CSVs
+    # (logs/baseline.csv, logs/dreamer.csv, logs/sdbs.csv) for inspection.
     variant = "sdbs" if args.sdbs else "baseline" if args.baseline else "dreamer"
     log_name = args.log_name or f"{variant}.csv"
 

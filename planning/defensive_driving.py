@@ -37,7 +37,6 @@ class DefensiveDrivingController:
 
         self._scale("w_vru", self.config.defensive_w_vru_mult)
         self._scale("w_vehicle", self.config.defensive_w_vehicle_mult)
-        self._scale("lambda_collision", self.config.defensive_lambda_collision_mult)
 
         self._set("dream_k", self.config.defensive_dream_k)
         if hasattr(self.config, "horizon_max"):

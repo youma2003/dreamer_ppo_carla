@@ -1,10 +1,10 @@
 # How to run & evaluate — quick runbook
 
 This project trains **end-to-end with a single command per variant** — there is
-nothing to run "part by part". The world model, traffic predictor, auxiliary
-heads, PPO policy, curriculum, and dreaming are all set up and trained inside
-one loop. The "Step 2–5" / "Tier 1–3" labels in the history are *build
-milestones*, not a sequence you have to execute.
+nothing to run "part by part". The world model, auxiliary heads, PPO policy,
+curriculum, and dreaming are all set up and trained inside one loop. The
+"Step 2–5" / "Tier 1–3" labels in the history are *build milestones*, not a
+sequence you have to execute.
 
 There are three variants (each writes its **own** CSV under `logs/`):
 
@@ -19,8 +19,8 @@ There are three variants (each writes its **own** CSV under `logs/`):
 ## 0. One-time check (no CARLA needed)
 
 ```bash
-python tests/test_mock.py        # full pipeline smoke test, ~seconds
-python tests/test_kpi.py         # KPI / comparison module
+python tests/test_mock.py                     # full pipeline smoke test, ~seconds
+python tests/test_integration_diagnostics.py   # dimension/horizon guardrails
 ```
 
 ## 1. (Optional) mock smoke test — confirms it runs without a CARLA server
@@ -45,34 +45,40 @@ python -m training.dreamer_ppo --sdbs          # -> logs/sdbs.csv
 ```
 
 Notes:
-- `--sdbs` is compute-heavy (~18 ms per planning step). For a first run, add
-  `--episodes N` to keep it short.
+- `--sdbs` is compute-heavy. For a first run, add `--episodes N` to keep it
+  short.
 - Add `--device cuda` if a GPU is available.
 - Override the filename with `--log-name myrun.csv` if you want.
 
-## 3. Compare the variants — the KPIs (VRU safety first)
+## 3. Inspect the per-variant logs
+
+Each run writes one row per episode to its own CSV under `logs/`. Open the
+three files (`baseline.csv`, `dreamer.csv`, `sdbs.csv`) directly, or load them
+with any tool (pandas, a spreadsheet, `plot_results.py`). The columns separate
+**VRU safety (primary)** from **vehicle safety (secondary)**:
+
+- **VRU safety:** `vru_collisions`, `vru_near_misses`, `min_ttc_vru`,
+  `avg_distance_to_vru`.
+- **Vehicle safety:** `vehicle_collisions`, `vehicle_near_misses`,
+  `rear_incidents`.
+- **Performance:** `return`, `route_completion`.
+
+A per-episode safety-progression table is printed during SDBS runs and can be
+regenerated from a CSV via `training.logger.Logger.create_summary_table`.
+
+## 4. Before integrating a checkpoint elsewhere — check dimensions first
+
+A silent state-vector dimension/order mismatch between training and inference
+is the most common cause of a checkpoint "not working" downstream. Always run
+the dimension check first:
 
 ```bash
-python -m scripts.compare_dreamers \
-    baseline=logs/baseline.csv \
-    dreamer=logs/dreamer.csv \
-    sdbs=logs/sdbs.csv \
-    --plot logs/plots/kpi.png
+python -m utils.checkpoint_check checkpoints/sdbs_final_model.pt --state-dim 55
 ```
 
-This prints a side-by-side table and saves a bar chart. Variants are **ranked
-by VRU (pedestrian/cyclist) safety first**, then by the overall composite.
-
-What the KPIs mean:
-- **VRU safety (primary):** collisions/ep, collision rate, near-misses/ep,
-  mean min time-to-collision, mean distance to VRU.
-- **Vehicle safety (secondary):** collisions, near-misses, rear incidents.
-- **Performance:** mean return, route completion, success rate.
-- **Headline scores (0–100, higher = better):**
-  - `vru_safety_score` — VRU safety only.
-  - `composite_score` — safety-weighted overall (55% VRU, 25% progress,
-    12% vehicle, 8% comfort), so a variant that drives further but hits a
-    pedestrian always ranks **below** a safer one.
-
-By default the comparison judges the **last 25% of episodes** (converged
-behaviour). Use `--tail 1.0` to score the whole run.
+If **route_completion stays at 0% across ALL variants** (baseline included),
+that is an env/reward wiring bug, not a policy-quality issue — the trainers
+print a `ProgressMonitor` warning when the `route_progress` signal never
+advances. See the "Integrating this checkpoint elsewhere" section in
+[README.md](README.md) for the full checklist (including starting S-DBS at
+`sdbs_force_fixed_params=True, horizon=1, groups=1`).

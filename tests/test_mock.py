@@ -269,7 +269,6 @@ def test_full_sdbs_loop(config):
     small.compute_budget = 30
     small.scenarios_per_stage = 2
     small.max_scenarios_per_episode = 2
-    small.collect_prediction_data = False   # this test doesn't exercise prediction
     history = train_sdbs(small, mock=True, num_episodes=2, verbose=False,
                          log_dir=None, ckpt_dir=None)
     assert len(history) == 2
@@ -280,37 +279,6 @@ def test_full_sdbs_loop(config):
         assert "aux_loss" in h and np.isscalar(h["aux_loss"]) # aux losses computed
     assert any(h["aux_loss"] != 0.0 for h in history)         # heads actually trained
     ok("full_sdbs_loop", "2 episodes with S-DBS complete")
-
-
-def test_dreamer_ppo_with_prediction(config):
-    from configs.sdbs_config import SDBSConfig
-    from training.dreamer_ppo import train_sdbs
-    small = SDBSConfig()
-    small.rollout_size = 128
-    small.update_epochs = 1
-    small.batch_size = 64
-    small.max_episode_steps = 20
-    small.wm_warmup_steps = 0
-    small.wm_batch_size = 64
-    small.beam_width_max = 6
-    small.horizon_max = 2
-    small.num_groups_max = 2
-    small.compute_budget = 30
-    small.scenarios_per_stage = 2
-    small.max_scenarios_per_episode = 2
-    # Enable prediction with a small collection so it becomes "ready" fast.
-    small.collect_prediction_data = True
-    small.tp_collect_episodes = 6
-    small.tp_min_ready = 20
-    small.predict_horizon = 4
-    history = train_sdbs(small, mock=True, num_episodes=2, verbose=False,
-                         log_dir=None, ckpt_dir=None)
-    assert len(history) == 2
-    for h in history:
-        assert "tp_loss" in h and np.isscalar(h["tp_loss"])      # predictor trains
-        assert "collision_risk" in h                             # used in planning
-    assert any(h["tp_loss"] != 0.0 for h in history)             # actually trained
-    ok("dreamer_ppo_with_prediction", "2 episodes complete")
 
 
 def test_dreamer_ppo_tier1_safety(config):
@@ -336,7 +304,6 @@ def test_dreamer_ppo_tier1_safety(config):
     small.compute_budget = 30
     small.scenarios_per_stage = 2
     small.max_scenarios_per_episode = 2
-    small.collect_prediction_data = False
     history = train_sdbs(small, mock=True, num_episodes=2, verbose=False,
                          log_dir=None, ckpt_dir=None)
     assert len(history) == 2
@@ -383,7 +350,6 @@ def test_dreamer_ppo_tier2_generalization(config):
     small.compute_budget = 30
     small.scenarios_per_stage = 2
     small.max_scenarios_per_episode = 2
-    small.collect_prediction_data = False
     small.use_map_agnostic_features = True     # 48 -> 55 augmented state
     small.defensive_mode = True                # force defensive mode on
     base_w_vru = small.w_vru
@@ -422,7 +388,6 @@ def test_dreamer_ppo_tier3_logging(config):
         small.compute_budget = 30
         small.scenarios_per_stage = 2
         small.max_scenarios_per_episode = 2
-        small.collect_prediction_data = False
         history = train_sdbs(small, mock=True, num_episodes=2, verbose=False,
                              log_dir=tmp, ckpt_dir=None)
         assert len(history) == 2
@@ -479,7 +444,6 @@ def main():
     test_world_model_trainer(config)
     test_dreamer_ppo_full(config)
     test_full_sdbs_loop(config)
-    test_dreamer_ppo_with_prediction(config)
     test_dreamer_ppo_tier1_safety(config)
     test_dreamer_ppo_tier2_generalization(config)
     test_dreamer_ppo_tier3_logging(config)

@@ -1,15 +1,21 @@
 """All hyperparameters for the Dreamer-PPO CARLA project."""
 from dataclasses import dataclass
 
+from rewards.vru_reward import BASE_STATE_DIM, TIER1_EXTRA, TIER2_EXTRA
+
 
 @dataclass
 class Config:
     # Environment
-    # 48 = ego(6) + lane(4) + traffic(3) + 5 vehicle blocks x 5
-    #      (ahead/behind/left/right/nearest) + 2 VRUs x 5.
-    # (The Tier-1 spec said "42"; that is an arithmetic slip — 28 + 4 new
-    #  5-dim vehicle blocks = 48, which the VRU index constants 38/43 require.)
-    state_dim: int = 48
+    # The DEFAULT state is the original v1 28-dim layout — the checkpoint proven
+    # to work in the downstream SimLingo/dreamer_guard.py integration:
+    #   ego(6) + lane(4) + traffic(3) + vehicle_ahead(5) + 2 VRUs x 5 = 28.
+    # The expanded safety state is OPT-IN via the two flags below; __post_init__
+    # recomputes state_dim to the full trainable/exportable dimension:
+    #   28 + 20 (Tier-1 rear/side vehicles) + 7 (Tier-2 map-agnostic features).
+    state_dim: int = BASE_STATE_DIM
+    enable_tier1_state: bool = False   # 28 -> 48: rear/side vehicle awareness
+    enable_tier2_state: bool = False   # +7: map-agnostic generalization features
     action_dim: int = 4
     host: str = "localhost"
     port: int = 2000
@@ -56,13 +62,6 @@ class Config:
     vehicle_proximity_sigma: float = 5.0    # distance scale for proximity penalty
     min_lane_change_clearance: float = 2.0  # min safe side gap for a lane change
 
-    # Map-agnostic features (Tier 2: generalization to unknown towns)
-    use_map_agnostic_features: bool = True   # augment state with computed features
-    # 55 = 48 base + 7 features (in_lane_center + road-type one-hot[4] +
-    # visibility + oncoming). The brief said "49"; that assumed the 42-dim
-    # pre-Tier-1 state — with the 48-dim base it is 55.
-    augmented_state_dim: int = 55
-
     # Defensive driving mode (for unknown maps)
     defensive_mode: bool = False             # start in defensive mode
     unknown_map_detection: str = "manual"    # 'manual' or 'gps_comparison'
@@ -88,3 +87,13 @@ class Config:
     sdbs_fixed_horizon: int = 1
     sdbs_fixed_groups: int = 1
     sdbs_fixed_beam_width: int = 4
+
+    def __post_init__(self):
+        # state_dim is derived, not free: it is always the base v1 layout plus
+        # whichever opt-in tiers are enabled. This keeps a single source of
+        # truth so models, env, and validators agree on the dimension.
+        self.state_dim = (
+            BASE_STATE_DIM
+            + (TIER1_EXTRA if self.enable_tier1_state else 0)
+            + (TIER2_EXTRA if self.enable_tier2_state else 0)
+        )

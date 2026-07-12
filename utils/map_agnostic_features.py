@@ -16,6 +16,14 @@ import numpy as np
 _ONCOMING_LO = np.radians(150.0)
 _ONCOMING_HI = np.radians(210.0)
 
+_ROAD_TYPE_ONEHOT = {
+    "straight":     [1.0, 0.0, 0.0, 0.0],
+    "curve":        [0.0, 1.0, 0.0, 0.0],
+    "intersection": [0.0, 0.0, 1.0, 0.0],
+    "unknown":      [0.0, 0.0, 0.0, 1.0],
+}
+N_EXTRA_FEATURES = 7          # in_lane_center + road-type one-hot[4] + vis + oncoming
+
 _WEATHER_VIS_REDUCTION = {
     "clear": 0.0,
     "rain": 0.2,
@@ -66,6 +74,10 @@ def estimate_visibility(info, config=None):
 
 def detect_oncoming_traffic(state):
     """True if a side vehicle within 50 m heads roughly opposite to the ego."""
+    # Side-vehicle blocks (left 23-27, right 28-32) only exist with Tier-1
+    # state; without them there is nothing to compare, so report no oncoming.
+    if len(state) < 33:
+        return False
     ego_heading = float(state[3])
     for block in (state[23:28], state[28:33]):     # left, right vehicle blocks
         if float(block[0]) < 50.0:                 # within 50 m
@@ -90,3 +102,18 @@ def compute_map_agnostic_features(state, info, config=None):
         "time_of_day": info.get("time_of_day", "day"),
         "weather": info.get("weather", "clear"),
     }
+
+
+def map_agnostic_vector(state, info, config=None):
+    """Return the 7-dim map-agnostic feature vector for ``state`` (np.float32).
+
+    in_lane_center (1) + road-type one-hot (4) + visibility (1) + oncoming (1).
+    """
+    feats = compute_map_agnostic_features(state, info, config)
+    extra = [feats["in_lane_center"]]
+    # 'sharp_curve' (and anything unmapped) falls back to the 'unknown' slot.
+    extra.extend(_ROAD_TYPE_ONEHOT.get(feats["road_type"],
+                                       _ROAD_TYPE_ONEHOT["unknown"]))
+    extra.append(feats["visibility"])
+    extra.append(float(feats["oncoming_traffic"]))
+    return np.asarray(extra, dtype=np.float32)

@@ -290,7 +290,7 @@ def test_dreamer_ppo_tier1_safety(config):
     from planning.sdbs_planner import SDBSPlanner, LANE_CHANGE_STEER_CLAMP
     from rewards.vru_reward import VEHICLE_RIGHT_DIST, VEHICLE_AHEAD_DIST, EGO_SPEED
 
-    small = SDBSConfig()
+    small = SDBSConfig(enable_tier1_state=True)   # opt-in 48-dim state
     assert small.state_dim == 48
     small.rollout_size = 128
     small.update_epochs = 1
@@ -337,7 +337,8 @@ def test_dreamer_ppo_tier1_safety(config):
 def test_dreamer_ppo_tier2_generalization(config):
     from configs.sdbs_config import SDBSConfig
     from training.dreamer_ppo import train_sdbs
-    small = SDBSConfig()
+    # Opt-in Tier-1 + Tier-2 -> 55-dim state built by the env directly.
+    small = SDBSConfig(enable_tier1_state=True, enable_tier2_state=True)
     small.rollout_size = 128
     small.update_epochs = 1
     small.batch_size = 64
@@ -350,7 +351,6 @@ def test_dreamer_ppo_tier2_generalization(config):
     small.compute_budget = 30
     small.scenarios_per_stage = 2
     small.max_scenarios_per_episode = 2
-    small.use_map_agnostic_features = True     # 48 -> 55 augmented state
     small.defensive_mode = True                # force defensive mode on
     base_w_vru = small.w_vru
     history = train_sdbs(small, mock=True, num_episodes=2, verbose=False,
@@ -410,7 +410,8 @@ def test_dreamer_ppo_tier3_logging(config):
         shutil.rmtree(tmp, ignore_errors=True)
 
     # LaneChangeExplainer logs a decision when a lane change is planned.
-    cfg = SDBSConfig()
+    # Lane-change reasoning uses side vehicles, so exercise it with Tier-1.
+    cfg = SDBSConfig(enable_tier1_state=True)
     cfg.compute_budget = 30
     policy = ActorCritic(cfg.state_dim, cfg.action_dim, cfg.hidden)
     wm = WorldModel(cfg.state_dim, cfg.action_dim, cfg.wm_hidden)
@@ -429,7 +430,10 @@ def test_dreamer_ppo_tier3_logging(config):
 
 def main():
     config = Config()
-    print("Running Dreamer-PPO mock pipeline tests (no CARLA needed)...\n")
+    assert config.state_dim == 28, config.state_dim
+    print("Running Dreamer-PPO mock pipeline tests (no CARLA needed)...")
+    print(f"Default Config().state_dim = {config.state_dim} "
+          f"(original v1 layout; Tier-1/2 are opt-in)\n")
     test_env(config)
     test_world_model(config)
     test_rssm(config)

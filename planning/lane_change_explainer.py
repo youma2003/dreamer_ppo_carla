@@ -4,8 +4,8 @@ For each lane change (or blocked attempt) it captures when, which direction,
 the surrounding-vehicle context, whether a safety mandate blocked it, and a
 short reason — so a reviewer can audit exactly why each maneuver happened.
 
-State indices match the 48-dim layout: rear vehicle 18/19, left 23, right 28,
-ego speed 2.
+The rear/left/right vehicle context only exists with Tier-1 state; in the base
+28-dim layout those indices are read as 0.0 (no side-vehicle awareness).
 """
 import json
 
@@ -40,16 +40,22 @@ class LaneChangeExplainer:
 
         mandate_reason = mandate.get("reason") if isinstance(mandate, dict) else None
         info = info or {}
+
+        # Side/rear vehicle context only exists with Tier-1 state; fall back to
+        # 0.0 for the base 28-dim layout instead of indexing out of bounds.
+        def _get(idx):
+            return float(state[idx]) if idx < len(state) else 0.0
+
         self.lane_change_log.append({
             "timestep": int(timestep),
             "steering": steering,
             "direction": direction,
             # Safety context
-            "vehicle_rear_dist": float(state[VEHICLE_BEHIND_DIST]),
-            "vehicle_rear_speed": float(state[VEHICLE_BEHIND_DIST + 1]),
-            "vehicle_left_dist": float(state[VEHICLE_LEFT_DIST]),
-            "vehicle_right_dist": float(state[VEHICLE_RIGHT_DIST]),
-            "ego_speed": float(state[EGO_SPEED]),
+            "vehicle_rear_dist": _get(VEHICLE_BEHIND_DIST),
+            "vehicle_rear_speed": _get(VEHICLE_BEHIND_DIST + 1),
+            "vehicle_left_dist": _get(VEHICLE_LEFT_DIST),
+            "vehicle_right_dist": _get(VEHICLE_RIGHT_DIST),
+            "ego_speed": _get(EGO_SPEED),
             # Mandate
             "blocked_by_mandate": blocked,
             "mandate_reason": mandate_reason,

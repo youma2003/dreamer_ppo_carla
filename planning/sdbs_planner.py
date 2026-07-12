@@ -22,9 +22,9 @@ import time
 import numpy as np
 import torch
 
-from rewards.vru_reward import EGO_SPEED, VRU_DIST_INDICES
+from rewards.vru_reward import EGO_SPEED, resolve_layout
 from env.carla_env import (
-    VEHICLE_AHEAD_DIST, VEHICLE_BEHIND_DIST, VEHICLE_LEFT_DIST, VEHICLE_RIGHT_DIST,
+    VEHICLE_AHEAD_DIST, VEHICLE_LEFT_DIST, VEHICLE_RIGHT_DIST,
     validate_state_vector,
 )
 from planning.sdbs_core import (
@@ -46,6 +46,7 @@ class SDBSPlanner:
         self.world_model = world_model
         self.critic = critic if critic is not None else policy
         self.config = config
+        self.layout = resolve_layout(config)
         self.device = torch.device(device)
         self.beam = None        # most recent BeamState (handy for inspection/tests)
         self.defensive_controller = DefensiveDrivingController(config)
@@ -89,13 +90,14 @@ class SDBSPlanner:
         cfg = self.config
         info = info or {}
 
+        vru_indices = self.layout.vru_indices
         n_vru = info.get("n_vru")
         if n_vru is None:
-            n_vru = sum(1 for idx in VRU_DIST_INDICES if 0 < float(s[idx]) < 40.0)
+            n_vru = sum(1 for idx in vru_indices if 0 < float(s[idx]) < 40.0)
 
         ego_speed = float(s[EGO_SPEED])
         ttcs = [float(s[idx]) / (ego_speed + 1e-6)
-                for idx in VRU_DIST_INDICES if float(s[idx]) > 0]
+                for idx in vru_indices if float(s[idx]) > 0]
         min_ttc = min(ttcs) if ttcs else cfg.tau_ttc * 5.0
         ttc_deficit = max(0.0, cfg.tau_ttc - min_ttc)
 
@@ -154,7 +156,7 @@ class SDBSPlanner:
 
         ego_speed = float(s[EGO_SPEED])
         ttcs = [float(s[idx]) / (ego_speed + 1e-6)
-                for idx in VRU_DIST_INDICES if float(s[idx]) > 0]
+                for idx in self.layout.vru_indices if float(s[idx]) > 0]
         min_ttc = min(ttcs) if ttcs else float("inf")
         if min_ttc < cfg.tau_safe:
             return {"mandate": "stop", "clamped_controls": stop, "min_ttc": min_ttc}
@@ -171,9 +173,10 @@ class SDBSPlanner:
         # A lane change is requested when |steering| exceeds the threshold;
         # steering < 0 turns left, > 0 turns right. If a vehicle occupies the
         # target side within the (speed-scaled) clearance, block the change by
-        # clamping steering to keep the car in its lane.
+        # clamping steering to keep the car in its lane. Side-vehicle awareness
+        # only exists with Tier-1 state, so the check is skipped otherwise.
         requested_steer = float(info.get("requested_action_steering", 0.0))
-        if abs(requested_steer) > LANE_CHANGE_STEER_THRESHOLD:
+        if self.layout.tier1 and abs(requested_steer) > LANE_CHANGE_STEER_THRESHOLD:
             if requested_steer < 0:
                 target = s[VEHICLE_LEFT_DIST:VEHICLE_LEFT_DIST + 5]
                 direction = "left"

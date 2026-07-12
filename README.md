@@ -16,43 +16,55 @@ each writing its own CSV log under `logs/`:
 
 See [RUNME.md](RUNME.md) for the exact commands and log-inspection steps.
 
-## The state-vector contract
+## The state-vector contract (default is 28 dims — the v1 layout)
 
-The policy input dimension is a single source of truth in
-`env/carla_env.py`:
+The **default** trainable/exportable state is the original **28-dim v1
+layout**, the checkpoint proven to work in the downstream
+SimLingo/`dreamer_guard.py` integration:
 
-- `STATE_DIM = 55` — the full augmented state.
-- `STATE_LAYOUT` — the index ranges of every field block.
-- The base env emits `config.state_dim` (48) features: ego, lane, traffic,
-  five vehicle blocks (ahead/behind/left/right/nearest), and two VRUs. The
-  map-agnostic wrapper appends the final 7 features to reach 55 in the S-DBS
-  path.
+```
+ego(6) + lane(4) + traffic(3) + vehicle_ahead(5) + 2 VRUs x 5 = 28
+```
 
-`validate_state_vector(state, expected_dim=STATE_DIM)` raises immediately on a
-shape mismatch — it **never** silently pads, truncates, or reshapes. It is
-called at the start of `CarlaEnv.reset()`/`step()`, `SDBSPlanner.plan()`, and
-`ActorCritic.act()`/`forward()`, so a wrong dimension fails loudly at the
-first model call instead of silently producing garbage.
+The expanded safety features are **opt-in** and are NOT part of the default
+exported checkpoint until independently validated against a real downstream
+adapter:
+
+- **Tier 1** (`config.enable_tier1_state`) — rear/side/nearest vehicle
+  awareness, inserting four extra vehicle blocks (28 → 48). This shifts the VRU
+  block from index 18 to 38.
+- **Tier 2** (`config.enable_tier2_state`) — map-agnostic generalization
+  features appended at the end (+7).
+
+`config.state_dim` is derived from these flags (28 / 35 / 48 / 55); the layout
+index positions come from `rewards.vru_reward.resolve_layout(config)` — never
+hardcode the moving VRU indices. `env.carla_env.expected_state_dim(config)`
+returns the full dimension for a config, and
+`validate_state_vector(state, expected_dim)` raises immediately on a shape
+mismatch — it **never** silently pads, truncates, or reshapes. It is called at
+the start of `CarlaEnv.reset()`/`step()`, `SDBSPlanner.plan()`, and
+`ActorCritic.act()`/`forward()`, so a wrong dimension fails loudly at the first
+model call instead of silently producing garbage.
 
 ## Integrating this checkpoint elsewhere
 
 Before wiring a trained checkpoint into ANY external runtime/adapter
 (e.g. a CARLA/SimLingo adapter):
 
-1. **Run the dimension check.** Confirm the checkpoint's first-layer input
-   dimension matches the state vector you intend to feed it:
+1. **Run the dimension check.** The default checkpoint is 28-dim:
 
    ```bash
-   python -m utils.checkpoint_check checkpoints/sdbs_final_model.pt --state-dim 55
+   python -m utils.checkpoint_check checkpoints/best_model.pt --state-dim 28
    ```
 
-   A `FAIL` here means the checkpoint and your state vector disagree — it will
-   produce meaningless output until fixed.
+   (Use `--state-dim 48` if you trained with Tier-1, or `55` with Tier-1 +
+   Tier-2.) A `FAIL` here means the checkpoint and your state vector disagree —
+   it will produce meaningless output until fixed.
 
 2. **Print the state shape in the adapter.** Add a state-vector shape print
-   right before every model call and confirm it matches 55 (or your
-   configured dim). A silent dimension/order mismatch between training and
-   inference is the most common cause of a checkpoint "not working".
+   right before every model call and confirm it matches 28 (or your configured
+   dim). A silent dimension/order mismatch between training and inference is the
+   most common cause of a checkpoint "not working".
 
 3. **Start S-DBS at horizon=1, groups=1.** Set
    `sdbs_force_fixed_params=True, sdbs_fixed_horizon=1, sdbs_fixed_groups=1`

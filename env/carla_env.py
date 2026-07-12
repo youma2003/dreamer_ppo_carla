@@ -7,34 +7,46 @@ import numpy as np
 
 from configs.config import Config
 from rewards.vru_reward import (
-    compute_reward, compute_vru_risk_target, ROUTE_PROGRESS, LANE_OFFSET,
+    compute_reward, compute_vru_risk_target, resolve_layout, BASE_STATE_DIM,
+    ROUTE_PROGRESS, LANE_OFFSET,
     EGO_X, EGO_Y, EGO_SPEED, EGO_HEADING,
     VEHICLE_AHEAD_DIST, VEHICLE_BEHIND_DIST, VEHICLE_LEFT_DIST,
     VEHICLE_RIGHT_DIST, VEHICLE_NEAREST_DIST,
-    VRU1_DIST, VRU2_DIST,
 )
+from utils.map_agnostic_features import map_agnostic_vector
 
 
 # ---------------------------------------------------------------------- #
 # State-vector contract (single source of truth)
 # ---------------------------------------------------------------------- #
-# ``STATE_DIM`` is the full augmented state consumed by the policy in the
-# S-DBS path: 48 base env features + 7 map-agnostic features. The base env
-# itself emits ``config.state_dim`` (48 by default); the map-agnostic wrapper
-# appends the final 7. Update this table if the layout ever changes.
-STATE_DIM = 55
-STATE_LAYOUT = {
-    'ego': (0, 6),
-    'lane': (6, 10),
-    'traffic': (10, 13),
-    'vehicle_ahead': (13, 18),
-    'vehicle_behind': (18, 23),
-    'vehicle_left': (23, 28),
-    'vehicle_right': (28, 33),
-    'vehicle_nearest': (33, 38),
-    'vru': (38, 48),
-    'map_agnostic': (48, 55),
-}
+# The DEFAULT state is the original v1 28-dim layout; Tier-1 (rear/side
+# vehicles) and Tier-2 (map-agnostic features) are opt-in and grow the vector.
+# The expected dimension is therefore computed from the config's tier flags —
+# never hardcoded — via ``expected_state_dim`` / ``state_layout``.
+STATE_DIM = BASE_STATE_DIM     # default (both tiers off); real dim is per-config
+
+
+def expected_state_dim(config):
+    """Full state dimension implied by a config's tier flags (28/35/48/55)."""
+    return resolve_layout(config).dim
+
+
+def state_layout(config):
+    """Field-block index ranges for a config's layout (dynamic)."""
+    lay = resolve_layout(config)
+    ranges = {
+        'ego': (0, 6), 'lane': (6, 10), 'traffic': (10, 13),
+        'vehicle_ahead': (13, 18),
+    }
+    if lay.tier1:
+        ranges['vehicle_behind'] = (18, 23)
+        ranges['vehicle_left'] = (23, 28)
+        ranges['vehicle_right'] = (28, 33)
+        ranges['vehicle_nearest'] = (33, 38)
+    ranges['vru'] = (lay.vru0, lay.vru0 + 10)
+    if lay.tier2:
+        ranges['map_agnostic'] = (lay.map_start, lay.map_start + 7)
+    return ranges
 
 
 def validate_state_vector(state, expected_dim=STATE_DIM):
@@ -42,18 +54,18 @@ def validate_state_vector(state, expected_dim=STATE_DIM):
 
     Never silently pad, truncate, or reshape — a wrong dimension almost always
     means the state-building code and the trained checkpoint disagree, which
-    silently produces garbage. ``expected_dim`` defaults to the full augmented
-    contract (``STATE_DIM``); callers that operate on the base env state pass
-    their own configured dimension so the check fires on true mismatches
-    without conflating the base (48) and augmented (55) layouts.
+    silently produces garbage. ``expected_dim`` is the dimension the caller
+    expects; pass ``expected_state_dim(config)`` (or the model's ``state_dim``)
+    so the check fires on true mismatches in every layout (28/35/48/55).
     """
     dim = state.shape[-1]
     if dim != expected_dim:
         raise ValueError(
             f"State vector has {dim} dims, expected {expected_dim}. "
-            f"Layout (full augmented state): {STATE_LAYOUT}. "
-            f"This usually means the state-building code and the trained "
-            f"checkpoint disagree on dimensions."
+            f"Default is the original v1 28-dim layout; Tier-1 (+20) and "
+            f"Tier-2 (+7) are opt-in via config.enable_tier1_state / "
+            f"enable_tier2_state. This usually means the state-building code "
+            f"and the trained checkpoint disagree on dimensions."
         )
 
 
@@ -101,12 +113,15 @@ def classify_vehicles(ego_x, ego_y, ego_heading, lane_width, vehicles,
 class CarlaEnv:
     """Flat-vector CARLA driving environment.
 
-    State vector (dim=28):
+    Default state vector (dim=28, original v1 layout):
       ego (6):     x, y, speed, heading, acc_x, acc_y
       lane (4):    lane_offset, lane_width, road_curvature, is_junction
       traffic (3): traffic_light_state, dist_to_light, route_progress
-      vehicles (5):nearest_vehicle dist, speed, heading, rel_x, rel_y
+      vehicle (5): ahead: dist, speed, heading, rel_x, rel_y
       VRU (10):    up to 2 VRUs, each: dist, speed, heading, rel_x, rel_y
+
+    Opt-in expansions (config.enable_tier1_state / enable_tier2_state) insert
+    four extra vehicle blocks (+20) and/or append map-agnostic features (+7).
 
     Action (Box(4,)): [steering(-1,1), throttle(0,1), brake(0,1), stop_continue(0,1)]
     """
@@ -114,7 +129,11 @@ class CarlaEnv:
     def __init__(self, mock=False, config=None):
         self.config = config or Config()
         self.mock = mock
+        self.layout = resolve_layout(self.config)
         self.state_dim = self.config.state_dim
+        assert self.layout.dim == self.state_dim, (
+            f"config.state_dim={self.state_dim} disagrees with layout "
+            f"dim={self.layout.dim}")
         self.action_dim = self.config.action_dim
         self.rng = np.random.default_rng()
 
@@ -195,6 +214,8 @@ class CarlaEnv:
     # Mock helpers
     # ------------------------------------------------------------------ #
     def _random_state(self):
+        """Build a random mock state whose layout matches the enabled tiers."""
+        lay = self.layout
         s = np.zeros(self.state_dim, dtype=np.float32)
         # ego
         s[0:2] = self.rng.uniform(-100, 100, size=2)       # x, y
@@ -210,19 +231,27 @@ class CarlaEnv:
         s[10] = float(self.rng.integers(0, 3))              # light state 0/1/2
         s[11] = self.rng.uniform(0, 50)                     # dist_to_light
         s[12] = self.rng.uniform(0, 1)                      # route_progress
-        # vehicle blocks: ahead[13], behind[18], left[23], right[28], nearest[33]
-        for base in (VEHICLE_AHEAD_DIST, VEHICLE_BEHIND_DIST, VEHICLE_LEFT_DIST,
-                     VEHICLE_RIGHT_DIST, VEHICLE_NEAREST_DIST):
+        # vehicle blocks: "ahead" is always present; the rear/side/nearest
+        # blocks exist only when Tier-1 state is enabled.
+        vehicle_bases = [VEHICLE_AHEAD_DIST]
+        if lay.tier1:
+            vehicle_bases += [VEHICLE_BEHIND_DIST, VEHICLE_LEFT_DIST,
+                              VEHICLE_RIGHT_DIST, VEHICLE_NEAREST_DIST]
+        for base in vehicle_bases:
             s[base] = self.rng.uniform(3, 60)               # dist
             s[base + 1] = self.rng.uniform(0, 15)           # speed
             s[base + 2] = self.rng.uniform(-np.pi, np.pi)   # heading
             s[base + 3:base + 5] = self.rng.uniform(-30, 30, size=2)  # rel_x, rel_y
-        # VRUs at [38..42] and [43..47]
-        for base in (VRU1_DIST, VRU2_DIST):
+        # VRUs (two blocks) at the layout-resolved position.
+        for base in lay.vru_indices:
             s[base] = self.rng.uniform(1, 40)               # dist
             s[base + 1] = self.rng.uniform(0, 3)            # speed
             s[base + 2] = self.rng.uniform(-np.pi, np.pi)   # heading
             s[base + 3:base + 5] = self.rng.uniform(-20, 20, size=2)
+        # Tier-2: append computed map-agnostic features at the end.
+        if lay.tier2:
+            s[lay.map_start:lay.map_start + 7] = map_agnostic_vector(
+                s[:lay.map_start], {}, self.config)
         return s
 
     def _mock_info(self, state, action, progress):
@@ -256,31 +285,34 @@ class CarlaEnv:
     # ------------------------------------------------------------------ #
     # Per-step safety signals
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def _compute_safety_lists(state):
+    def _compute_safety_lists(self, state):
         """Per-step TTC / distance lists for VRUs and vehicles (for tracking).
 
         Returns a dict with parallel ``*_ttc_list`` / ``*_distance_list`` and,
         for vehicles, a ``vehicle_directions`` list (front/rear/left/right).
         TTC uses the direction-appropriate closing speed; non-closing pairs get
-        a large TTC so they are not counted as near-misses.
+        a large TTC so they are not counted as near-misses. Only the vehicle
+        directions that exist in the current layout are considered (the base
+        v1 layout has "front" only; rear/side need Tier-1 state).
         """
         s = np.asarray(state, dtype=np.float32)
         ego_speed = float(s[EGO_SPEED])
 
         vru_ttc, vru_dist = [], []
-        for idx in (VRU1_DIST, VRU2_DIST):
+        for idx in self.layout.vru_indices:
             dist = float(s[idx])
             if dist <= 0:
                 continue
             vru_dist.append(dist)
             vru_ttc.append(dist / max(0.1, ego_speed))
 
+        veh_blocks = [(VEHICLE_AHEAD_DIST, "front")]
+        if self.layout.tier1:
+            veh_blocks += [(VEHICLE_BEHIND_DIST, "rear"),
+                           (VEHICLE_LEFT_DIST, "left"),
+                           (VEHICLE_RIGHT_DIST, "right")]
         veh_ttc, veh_dist, veh_dirs = [], [], []
-        for base, direction in ((VEHICLE_AHEAD_DIST, "front"),
-                                (VEHICLE_BEHIND_DIST, "rear"),
-                                (VEHICLE_LEFT_DIST, "left"),
-                                (VEHICLE_RIGHT_DIST, "right")):
+        for base, direction in veh_blocks:
             dist = float(s[base])
             if dist <= 0 or dist >= 100:        # skip placeholder / far vehicles
                 continue
@@ -423,12 +455,19 @@ class CarlaEnv:
             })
         blocks = classify_vehicles(s[EGO_X], s[EGO_Y], s[EGO_HEADING], s[7],
                                    vehicles)
-        for base, key in ((VEHICLE_AHEAD_DIST, "ahead"),
-                          (VEHICLE_BEHIND_DIST, "behind"),
-                          (VEHICLE_LEFT_DIST, "left"),
-                          (VEHICLE_RIGHT_DIST, "right"),
-                          (VEHICLE_NEAREST_DIST, "nearest")):
+        # "ahead" is always present; rear/side/nearest only exist with Tier-1.
+        vehicle_slots = [(VEHICLE_AHEAD_DIST, "ahead")]
+        if self.layout.tier1:
+            vehicle_slots += [(VEHICLE_BEHIND_DIST, "behind"),
+                              (VEHICLE_LEFT_DIST, "left"),
+                              (VEHICLE_RIGHT_DIST, "right"),
+                              (VEHICLE_NEAREST_DIST, "nearest")]
+        for base, key in vehicle_slots:
             s[base:base + 5] = blocks[key]
+        # Tier-2: append computed map-agnostic features at the end.
+        if self.layout.tier2:
+            s[self.layout.map_start:self.layout.map_start + 7] = \
+                map_agnostic_vector(s[:self.layout.map_start], {}, self.config)
         return s
 
     def _real_info(self, state, action):  # pragma: no cover - requires CARLA

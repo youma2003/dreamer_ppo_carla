@@ -27,7 +27,7 @@ from planning.sdbs_planner import SDBSPlanner
 from planning.curriculum import (
     ScenarioBank, SumTree, PrioritizedScenarioReplayer, RiskAwareCurriculum,
 )
-from rewards.vru_reward import EGO_SPEED, VRU1_DIST, VRU2_DIST
+from rewards.vru_reward import EGO_SPEED, resolve_layout
 
 
 def ok(name, result=""):
@@ -35,14 +35,17 @@ def ok(name, result=""):
 
 
 def _mock_state(config, vru_dists=(30.0, 30.0), speed=5.0, x=0.0, y=0.0):
+    # Place the VRU blocks at the layout-resolved position so this helper works
+    # at any dimension (28 default, 48/55 with tiers enabled).
+    lay = resolve_layout(config)
     s = np.zeros(config.state_dim, dtype=np.float32)
     s[0], s[1] = x, y
     s[EGO_SPEED] = speed
     s[7] = 3.5
     s[10] = 2.0          # traffic light: green (0 = red)
     s[11] = 50.0         # dist to light (far)
-    s[VRU1_DIST] = vru_dists[0]
-    s[VRU2_DIST] = vru_dists[1]
+    s[lay.vru0] = vru_dists[0]
+    s[lay.vru1] = vru_dists[1]
     return s
 
 

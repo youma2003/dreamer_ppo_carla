@@ -54,7 +54,11 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('checkpoint_path')
-    parser.add_argument('--state-dim', type=int, default=55)
+    parser.add_argument(
+        '--state-dim', type=int, default=28,
+        help="28 = original v1 layout (default, proven working). Use 48 with "
+             "--enable-tier1, 55 with --enable-tier1 --enable-tier2 if training "
+             "with expanded safety state.")
     parser.add_argument('--action-dim', type=int, default=4)
     args = parser.parse_args()
     check_checkpoint_compatibility(args.checkpoint_path, args.state_dim,

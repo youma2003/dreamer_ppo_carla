@@ -8,7 +8,7 @@ sampling), so the metric is reproducible.
 import numpy as np
 import torch
 
-from rewards.vru_reward import EGO_SPEED, ROUTE_PROGRESS, VRU_DIST_INDICES
+from rewards.vru_reward import EGO_SPEED, ROUTE_PROGRESS, resolve_layout
 
 
 class Evaluator:
@@ -17,13 +17,14 @@ class Evaluator:
         self.policy = policy
         self.world_model = world_model
         self.config = config
+        self.layout = resolve_layout(config)
         self.device = torch.device(device)
 
     def _near_misses(self, state):
         """Count VRUs whose time-to-collision is under tau_ttc this step."""
         ego_speed = float(state[EGO_SPEED])
         count = 0
-        for idx in VRU_DIST_INDICES:
+        for idx in self.layout.vru_indices:
             ttc = float(state[idx]) / (ego_speed + 1e-6)
             if ttc < self.config.tau_ttc:
                 count += 1

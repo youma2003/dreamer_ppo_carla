@@ -35,7 +35,14 @@ from rewards.vru_reward import (
 )
 
 ZERO = np.zeros(4, dtype=np.float32)
-DIM = Config().state_dim
+# Tier-1 rear/side vehicle awareness is opt-in; enable it explicitly to test
+# the expanded 28 -> 48 layout (VRU block moves to 38/43, constants above).
+TIER1 = dict(enable_tier1_state=True)
+DIM = Config(**TIER1).state_dim          # 48
+
+
+def tier1_config():
+    return Config(**TIER1)
 
 
 def ok(name, result=""):
@@ -57,7 +64,8 @@ def safe_state():
 
 
 def make_planner():
-    cfg = SDBSConfig()      # SDBSConfig adds tau_safe + the mandate parameters
+    # SDBSConfig adds tau_safe + the mandate parameters; Tier-1 gives 48-dim.
+    cfg = SDBSConfig(**TIER1)
     policy = ActorCritic(cfg.state_dim, cfg.action_dim, cfg.hidden)
     wm = WorldModel(cfg.state_dim, cfg.action_dim, cfg.wm_hidden)
     return SDBSPlanner(policy, wm, policy, cfg), cfg
@@ -65,11 +73,11 @@ def make_planner():
 
 # 1 ------------------------------------------------------------------- #
 def test_state_vector_size():
-    env = CarlaEnv(mock=True, config=Config())
+    env = CarlaEnv(mock=True, config=tier1_config())
     state = env.reset()
     assert state.shape == (48,), f"state is {state.shape}, expected (48,)"
     env.close()
-    ok("state_vector_size", "48 dimensions")
+    ok("state_vector_size", "48 dimensions (Tier-1 enabled)")
 
 
 # 2 ------------------------------------------------------------------- #
@@ -91,7 +99,7 @@ def test_vehicle_detection():
 
 # 3 ------------------------------------------------------------------- #
 def test_vehicle_reward():
-    cfg = Config()
+    cfg = tier1_config()
     state = safe_state()
     state[VEHICLE_AHEAD_DIST] = 2.0           # vehicle very close ahead
     state[EGO_SPEED] = 5.0
@@ -106,7 +114,7 @@ def test_vehicle_reward():
 
 # 4 ------------------------------------------------------------------- #
 def test_rear_collision_risk():
-    cfg = Config()
+    cfg = tier1_config()
     state = safe_state()
     state[EGO_SPEED] = 8.0
     state[VEHICLE_BEHIND_DIST] = 5.0          # 5 m behind

@@ -33,8 +33,12 @@ from training.map_agnostic_state import MapAgnosticStateWrapper
 from utils.map_agnostic_features import compute_map_agnostic_features
 from utils.map_detection import is_unknown_map, activate_defensive_mode_if_unknown
 
-DIM = Config().state_dim          # 48
-AUG = DIM + 7                     # 55
+# Tier-2 (map-agnostic features) builds on Tier-1 state. Enable both explicitly
+# so the augmented state is 48 (Tier-1 base) -> 55 (with the 7 features).
+TIER1 = dict(enable_tier1_state=True)
+TIER12 = dict(enable_tier1_state=True, enable_tier2_state=True)
+DIM = Config(**TIER1).state_dim           # 48 (Tier-1 base)
+AUG = Config(**TIER12).state_dim          # 55 (Tier-1 + Tier-2)
 
 
 def ok(name, result=""):
@@ -49,7 +53,7 @@ def test_map_agnostic_features():
     state[8] = 0.005        # straight
     state[9] = 0            # not an intersection
     info = {"weather": "clear", "vru_list": [], "vehicle_list": []}
-    feats = compute_map_agnostic_features(state, info, Config())
+    feats = compute_map_agnostic_features(state, info, Config(**TIER1))
     assert feats["in_lane_center"] > 0.9, feats["in_lane_center"]
     assert feats["road_type"] == "straight", feats["road_type"]
     assert feats["visibility"] > 0.8, feats["visibility"]
@@ -58,7 +62,8 @@ def test_map_agnostic_features():
 
 # 2 ------------------------------------------------------------------- #
 def test_state_augmentation():
-    wrapper = MapAgnosticStateWrapper(Config())
+    # The wrapper appends the 7 map features to a Tier-1 (48-dim) base -> 55.
+    wrapper = MapAgnosticStateWrapper(Config(**TIER1))
     state = np.zeros(DIM, dtype=np.float32)
     state[7] = 4.0
     augmented = wrapper.augment_state(state, {"weather": "clear"})
@@ -133,19 +138,18 @@ def test_unknown_map_defensive_activation():
 
 # 8 ------------------------------------------------------------------- #
 def test_augmented_state_pipeline():
-    cfg = Config()
-    cfg.use_map_agnostic_features = True
+    # With both tiers enabled the ENV itself emits the full 55-dim state
+    # (map-agnostic features appended) — no external wrapper needed.
+    cfg = Config(**TIER12)
     env = CarlaEnv(mock=True, config=cfg)
-    wrapper = MapAgnosticStateWrapper(cfg)
     obs = env.reset()
-    info = {}
-    assert wrapper.augment_state(obs, info).shape == (AUG,)
+    assert obs.shape == (AUG,), obs.shape
     for _ in range(5):
-        obs, _r, _done, info = env.step(
+        obs, _r, _done, _info = env.step(
             np.random.uniform(-1, 1, size=env.action_dim).astype(np.float32))
-        assert wrapper.augment_state(obs, info).shape == (AUG,)
+        assert obs.shape == (AUG,), obs.shape
     env.close()
-    ok("augmented_state_pipeline", "state wrapper works end-to-end")
+    ok("augmented_state_pipeline", "env emits full 55-dim state end-to-end")
 
 
 def main():

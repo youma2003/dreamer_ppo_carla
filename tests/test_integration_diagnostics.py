@@ -30,10 +30,12 @@ import torch
 
 from configs.config import Config
 from configs.sdbs_config import SDBSConfig
-from env.carla_env import CarlaEnv, STATE_DIM, validate_state_vector
+from env.carla_env import (
+    CarlaEnv, expected_state_dim, state_layout, validate_state_vector,
+)
 from models.actor_critic import ActorCritic
 from models.world_model import WorldModel
-from training.map_agnostic_state import MapAgnosticStateWrapper
+from rewards.vru_reward import resolve_layout, BASE_STATE_DIM
 from training.dreamer_ppo import train, train_sdbs, select_action_with_dreaming
 from planning.sdbs_planner import SDBSPlanner
 from utils.checkpoint_check import check_checkpoint_compatibility
@@ -64,26 +66,37 @@ def _small_sdbs_config(horizon=1, groups=1, beam_width=4):
 
 # 1 ------------------------------------------------------------------- #
 def test_state_dimension_contract():
-    """A correctly-built full state passes; a wrong-shaped one fails loudly."""
-    cfg = SDBSConfig()
-    env = CarlaEnv(mock=True, config=cfg)
-    wrapper = MapAgnosticStateWrapper(cfg)
-    base_state = env.reset()                       # base env dim (48)
-    full_state = wrapper.augment_state(base_state, {})   # augmented to 55
-    env.close()
+    """A correctly-built state passes; a wrong-shaped one fails loudly.
 
-    assert full_state.shape[-1] == STATE_DIM, full_state.shape
-    # Correctly-shaped input must NOT raise.
-    validate_state_vector(full_state)
+    The expected dimension is read from the config (28 default, 55 with both
+    tiers) — never a hardcoded constant.
+    """
+    # Default (v1) layout: the env emits exactly 28 dims.
+    cfg = Config()
+    env = CarlaEnv(mock=True, config=cfg)
+    state = env.reset()
+    env.close()
+    exp = expected_state_dim(cfg)
+    assert exp == 28, exp
+    assert state.shape[-1] == exp, state.shape
+    validate_state_vector(state, exp)              # correct shape -> no raise
 
     # Deliberately wrong-shaped input MUST raise (never silently reshape).
     raised = False
     try:
-        validate_state_vector(np.zeros(42, dtype=np.float32))
+        validate_state_vector(np.zeros(42, dtype=np.float32), exp)
     except ValueError:
         raised = True
     assert raised, "validate_state_vector accepted a 42-dim vector"
-    ok("state_dimension_contract", "validated correctly")
+
+    # With both tiers enabled the env emits 55 dims, and the check follows.
+    full_cfg = Config(enable_tier1_state=True, enable_tier2_state=True)
+    full_env = CarlaEnv(mock=True, config=full_cfg)
+    full_state = full_env.reset()
+    full_env.close()
+    assert full_state.shape[-1] == expected_state_dim(full_cfg) == 55
+    validate_state_vector(full_state, expected_state_dim(full_cfg))
+    ok("state_dimension_contract", "validated correctly (28 default, 55 tiers)")
 
 
 # 2 ------------------------------------------------------------------- #
@@ -117,8 +130,7 @@ def test_checkpoint_compatibility():
 # 3 ------------------------------------------------------------------- #
 def test_sdbs_h1_g1_equivalence():
     """Fixed H=1,G=1 S-DBS collapses to the same single-step path as dreaming."""
-    cfg = _small_sdbs_config(horizon=1, groups=1, beam_width=4)
-    cfg.use_map_agnostic_features = False          # keep it on the base dim
+    cfg = _small_sdbs_config(horizon=1, groups=1, beam_width=4)  # base 28-dim
     policy = ActorCritic(cfg.state_dim, cfg.action_dim, cfg.hidden)
     wm = WorldModel(cfg.state_dim, cfg.action_dim, cfg.wm_hidden)
     planner = SDBSPlanner(policy, wm, policy, cfg)
@@ -175,6 +187,33 @@ def test_incremental_horizon():
     ok("incremental_horizon", "H=1,2,3 all run cleanly")
 
 
+# 6 ------------------------------------------------------------------- #
+def test_default_config_matches_v1_layout():
+    """A fresh default Config() is the original v1 28-dim layout, in order.
+
+    Guards against silently defaulting to an expanded state that was never
+    validated against the downstream adapter.
+    """
+    cfg = Config()
+    assert cfg.state_dim == BASE_STATE_DIM == 28, cfg.state_dim
+    assert cfg.enable_tier1_state is False and cfg.enable_tier2_state is False
+
+    lay = resolve_layout(cfg)
+    assert lay.dim == 28 and lay.vru0 == 18, (lay.dim, lay.vru0)
+
+    # Field order is exactly ego/lane/traffic/vehicle_ahead/vru — no rear/side
+    # vehicle blocks and no map-agnostic block in the default layout.
+    ranges = state_layout(cfg)
+    assert list(ranges.keys()) == [
+        'ego', 'lane', 'traffic', 'vehicle_ahead', 'vru'], list(ranges.keys())
+    assert ranges['ego'] == (0, 6)
+    assert ranges['lane'] == (6, 10)
+    assert ranges['traffic'] == (10, 13)
+    assert ranges['vehicle_ahead'] == (13, 18)
+    assert ranges['vru'] == (18, 28)
+    ok("default_config_matches_v1_layout", "28-dim ego/lane/traffic/veh/vru")
+
+
 def main():
     print("Running S-DBS integration diagnostics (no CARLA needed)...\n")
     torch.manual_seed(0)
@@ -184,6 +223,7 @@ def main():
     test_sdbs_h1_g1_equivalence()
     test_progress_monitor()
     test_incremental_horizon()
+    test_default_config_matches_v1_layout()
     print("\n✅ ALL INTEGRATION DIAGNOSTIC TESTS PASSED")
 
 

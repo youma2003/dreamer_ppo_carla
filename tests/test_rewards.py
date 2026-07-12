@@ -20,27 +20,35 @@ import numpy as np
 
 from configs.config import Config
 from rewards.vru_reward import (
-    compute_reward, EGO_SPEED, ROUTE_PROGRESS, VRU1_DIST, VRU2_DIST,
+    compute_reward, resolve_layout, EGO_SPEED, ROUTE_PROGRESS,
     VEHICLE_AHEAD_DIST, VEHICLE_BEHIND_DIST, VEHICLE_LEFT_DIST, VEHICLE_RIGHT_DIST,
 )
 
 ZERO_ACTION = np.zeros(4, dtype=np.float32)
-_STATE_DIM = Config().state_dim
+# The reward is tested at the default (v1) config; the layout resolves the VRU
+# positions so this works whether or not tiers are enabled.
+_CONFIG = Config()
+_LAYOUT = resolve_layout(_CONFIG)
+_STATE_DIM = _CONFIG.state_dim
 
 
 def make_state(route_progress=0.0, ego_speed=0.0, vru_dist=50.0):
     """Build a state with the fields the reward cares about.
 
     Vehicle blocks default to "far" (100 m) so they add no proximity/rear
-    penalties unless a scenario sets them explicitly.
+    penalties unless a scenario sets them explicitly. Only the blocks present
+    in the current layout are set (base v1 has "ahead" only).
     """
     s = np.zeros(_STATE_DIM, dtype=np.float32)
     s[ROUTE_PROGRESS] = route_progress
     s[EGO_SPEED] = ego_speed
-    s[VRU1_DIST] = vru_dist
-    s[VRU2_DIST] = vru_dist
-    for idx in (VEHICLE_AHEAD_DIST, VEHICLE_BEHIND_DIST,
-                VEHICLE_LEFT_DIST, VEHICLE_RIGHT_DIST):
+    s[_LAYOUT.vru0] = vru_dist
+    s[_LAYOUT.vru1] = vru_dist
+    vehicle_bases = [VEHICLE_AHEAD_DIST]
+    if _LAYOUT.tier1:
+        vehicle_bases += [VEHICLE_BEHIND_DIST, VEHICLE_LEFT_DIST,
+                          VEHICLE_RIGHT_DIST]
+    for idx in vehicle_bases:
         s[idx] = 100.0
     return s
 

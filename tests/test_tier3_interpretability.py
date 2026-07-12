@@ -26,7 +26,9 @@ from training.logger import Logger
 from utils.safety_tracker import SafetyTracker
 from planning.lane_change_explainer import LaneChangeExplainer
 
-DIM = Config().state_dim          # 48
+# Lane-change interpretability concerns rear/side vehicles (Tier-1 state), so
+# use the Tier-1 layout where index 18 is the rear-vehicle block.
+DIM = Config(enable_tier1_state=True).state_dim          # 48
 
 
 def ok(name, result=""):

@@ -69,12 +69,13 @@ regenerated from a CSV via `training.logger.Logger.create_summary_table`.
 ## 4. Before integrating a checkpoint elsewhere — check dimensions first
 
 A silent state-vector dimension/order mismatch between training and inference
-is the most common cause of a checkpoint "not working" downstream. Always run
-the dimension check first:
+is the most common cause of a checkpoint "not working" downstream. The default
+state is the original v1 28-dim layout, so run the dimension check first:
 
 ```bash
-python -m utils.checkpoint_check checkpoints/sdbs_final_model.pt --state-dim 55
+python -m utils.checkpoint_check checkpoints/best_model.pt --state-dim 28
 ```
+(Use `--state-dim 48` if trained with Tier-1, `55` with Tier-1 + Tier-2.)
 
 If **route_completion stays at 0% across ALL variants** (baseline included),
 that is an env/reward wiring bug, not a policy-quality issue — the trainers

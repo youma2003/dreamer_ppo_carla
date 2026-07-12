@@ -304,18 +304,33 @@ def train(config=None, mock=False, num_episodes=None, verbose=True, log_dir=None
 # ---------------------------------------------------------------------- #
 # S-DBS training (Serendipitous Diverse Beam Search extension)
 # ---------------------------------------------------------------------- #
-def _build_occupancy_targets(states, grid=16, extent=20.0):
+def _occupancy_pairs(config):
+    """(rel_x, rel_y) index pairs of every agent block for the chosen layout.
+
+    Vehicle "ahead" and the two VRUs are always present; the rear/side/nearest
+    vehicle blocks only exist with Tier-1 state. Derived from the layout so the
+    occupancy target stays valid at 28/48/55 dims.
+    """
+    from rewards.vru_reward import (
+        resolve_layout, VEHICLE_AHEAD_DIST, VEHICLE_BEHIND_DIST,
+        VEHICLE_LEFT_DIST, VEHICLE_RIGHT_DIST, VEHICLE_NEAREST_DIST,
+    )
+    lay = resolve_layout(config)
+    bases = [VEHICLE_AHEAD_DIST]
+    if lay.tier1:
+        bases += [VEHICLE_BEHIND_DIST, VEHICLE_LEFT_DIST,
+                  VEHICLE_RIGHT_DIST, VEHICLE_NEAREST_DIST]
+    bases += [lay.vru0, lay.vru1]
+    return [(b + 3, b + 4) for b in bases]     # rel_x, rel_y within each block
+
+
+def _build_occupancy_targets(states, pairs, grid=16, extent=20.0):
     """Rasterize vehicle + VRU relative positions into a BEV occupancy grid
     target (B, grid, grid) for the scene-reconstruction head.
-
-    Relative-position (rel_x, rel_y) pairs in the 48-dim state: vehicle ahead
-    (16,17), behind (21,22), left (26,27), right (31,32), nearest (36,37),
-    VRU0 (41,42), VRU1 (46,47).
     """
     states = states.detach().cpu().numpy()
     b = states.shape[0]
     target = np.zeros((b, grid, grid), dtype=np.float32)
-    pairs = [(16, 17), (21, 22), (26, 27), (31, 32), (36, 37), (41, 42), (46, 47)]
     for i in range(b):
         for xi, yi in pairs:
             rx, ry = float(states[i, xi]), float(states[i, yi])
@@ -342,7 +357,6 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
     from models.auxiliary_heads import (
         SceneReconstructionHead, RiskDensityHead, WorldModelEnsemble,
     )
-    from training.map_agnostic_state import MapAgnosticStateWrapper
     from utils.safety_tracker import SafetyTracker
 
     config = config or SDBSConfig()
@@ -350,18 +364,11 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
         config.num_episodes = num_episodes
     device = torch.device(device)
 
-    # Tier-2: optionally augment the env's base state with map-agnostic features.
-    # The env still produces base-dim observations; the wrapper appends the
-    # 7 computed features, so policy/world-model/buffers use the augmented dim.
-    # (config.state_dim is left unchanged so base index logic stays valid.)
-    state_wrapper = MapAgnosticStateWrapper(config)
-    obs_dim = (config.augmented_state_dim if config.use_map_agnostic_features
-               else config.state_dim)
-
-    def _augment(obs, info):
-        if config.use_map_agnostic_features:
-            return state_wrapper.augment_state(obs, info)
-        return np.asarray(obs, dtype=np.float32)
+    # The env now emits the full state for the enabled tiers (base 28, +20 with
+    # Tier-1, +7 with Tier-2), so policy/world-model/buffers all use
+    # config.state_dim directly — no separate augmentation step.
+    obs_dim = config.state_dim
+    occ_pairs = _occupancy_pairs(config)
 
     env = CarlaEnv(mock=mock, config=config)
     policy = ActorCritic(obs_dim, config.action_dim, config.hidden).to(device)
@@ -429,7 +436,7 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
             for scenario_id in scenario_ids:
                 buffer.clear()
                 info = {}
-                obs = _augment(env.reset_to_scenario(scenario_id), info)
+                obs = env.reset_to_scenario(scenario_id)
 
                 while not buffer.is_full():
                     state = torch.as_tensor(obs, dtype=torch.float32, device=device)
@@ -448,7 +455,6 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
                         safety_tracker.record_lane_change(is_safe=True)
 
                     next_obs, reward, done, info = env.step(action_np)
-                    next_obs = _augment(next_obs, info)
 
                     # Tier-3: accumulate per-step safety metrics.
                     for d, ttc in zip(info.get("vru_distance_list", []),
@@ -503,7 +509,7 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
                             "route_completion": ep_completion,
                         })
                         safety_tracker.record_episode_completion(ep_completion)
-                        obs = _augment(env.reset_to_scenario(scenario_id), info)
+                        obs = env.reset_to_scenario(scenario_id)
 
                 if buffer.path_start < buffer.ptr:
                     with torch.no_grad():
@@ -541,7 +547,8 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
                     # ---- auxiliary grounding heads ---- #
                     feats = policy.trunk(wm_batch["states"].float().to(device)).detach()
                     recon_logits = recon_head(feats)
-                    occ_target = _build_occupancy_targets(wm_batch["states"]).to(device)
+                    occ_target = _build_occupancy_targets(
+                        wm_batch["states"], occ_pairs).to(device)
                     recon_loss = recon_head.loss(recon_logits, occ_target)
 
                     risk_pred = risk_density_head(feats)
@@ -630,6 +637,13 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
     return history
 
 
+def _print_variant_header(variant, cfg):
+    """Announce the variant and the state dimension it will train/export at."""
+    print(f"Variant: {variant} | state_dim={cfg.state_dim} "
+          f"(tier1={cfg.enable_tier1_state}, tier2={cfg.enable_tier2_state}) | "
+          f"default is the 28-dim v1 layout")
+
+
 def main():
     # Ensure UTF-8 stdout so the 💾 marker renders on Windows consoles (cp1252).
     try:
@@ -662,16 +676,21 @@ def main():
 
     if args.baseline:
         from training.ppo_baseline import train_baseline
-        train_baseline(Config(), mock=args.mock, num_episodes=args.episodes,
+        cfg = Config()
+        _print_variant_header(variant, cfg)
+        train_baseline(cfg, mock=args.mock, num_episodes=args.episodes,
                        log_dir="logs", log_name=log_name)
     elif args.sdbs:
         from configs.sdbs_config import SDBSConfig
-        train_sdbs(SDBSConfig(), mock=args.mock, num_episodes=args.episodes,
+        cfg = SDBSConfig()
+        _print_variant_header(variant, cfg)
+        train_sdbs(cfg, mock=args.mock, num_episodes=args.episodes,
                    device=args.device, log_dir="logs", ckpt_dir="checkpoints",
                    log_name=log_name)
     else:
-        config = Config()
-        train(config, mock=args.mock, num_episodes=args.episodes,
+        cfg = Config()
+        _print_variant_header(variant, cfg)
+        train(cfg, mock=args.mock, num_episodes=args.episodes,
               device=args.device, log_dir="logs", ckpt_dir="checkpoints",
               log_name=log_name)
     print(f"\nLog written to logs/{log_name}")

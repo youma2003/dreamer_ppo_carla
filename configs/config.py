@@ -88,6 +88,12 @@ class Config:
     sdbs_fixed_groups: int = 1
     sdbs_fixed_beam_width: int = 4
 
+    # SAFE-DREAM safety evaluation.
+    # A beam-search candidate whose final composite score falls below this
+    # threshold is counted as "rejected as unsafe" for the Unsafe Maneuver
+    # Rejection Rate (UMRR) metric. Tune later once real score scales settle.
+    unsafe_score_threshold: float = -5.0
+
     def __post_init__(self):
         # state_dim is derived, not free: it is always the base v1 layout plus
         # whichever opt-in tiers are enabled. This keeps a single source of

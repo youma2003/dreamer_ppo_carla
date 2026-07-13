@@ -213,6 +213,19 @@ class SDBSPlanner:
              - self.config.w_risk * float(risk.reshape(-1)[0]))
         return next_state.reshape(-1).cpu().numpy(), float(r)
 
+    def _predict_risk(self, state_np, action):
+        """World-model risk_hat for one (state, action) — SAFE-DREAM diagnostics.
+
+        Additive helper used only to populate per-candidate risk predictions in
+        plan()'s metadata; it does not affect scoring or selection.
+        """
+        st = torch.as_tensor(np.asarray(state_np, dtype=np.float32),
+                             device=self.device).reshape(1, -1)
+        ac = torch.as_tensor(np.asarray(action, dtype=np.float32),
+                             device=self.device).reshape(1, -1)
+        out = self.world_model(st, ac)
+        return float(out[1].reshape(-1)[0])
+
     def _dream_forward(self, state, actions_seq, world_model=None):
         """Unroll the world model for a fixed action sequence.
 
@@ -339,6 +352,11 @@ class SDBSPlanner:
         budget = 0
         best_searched = None
 
+        # SAFE-DREAM per-decision diagnostics (additive; no effect on search).
+        unsafe_thr = getattr(self.config, "unsafe_score_threshold", -5.0)
+        n_candidates_evaluated = 0
+        n_candidates_rejected_unsafe = 0
+
         for depth in range(H):
             new_groups = []
             for g_idx, group in enumerate(beam.groups):
@@ -378,6 +396,10 @@ class SDBSPlanner:
                         child.score = self._score_plan(
                             child, g_idx, beam.groups, beam
                         )
+                        # SAFE-DREAM: tally every candidate and flag unsafe ones.
+                        n_candidates_evaluated += 1
+                        if child.score < unsafe_thr:
+                            n_candidates_rejected_unsafe += 1
                         expanded.append(child)
                 expanded.sort(key=lambda p: p.score, reverse=True)
                 new_groups.append(expanded[:b_per_group])
@@ -460,6 +482,19 @@ class SDBSPlanner:
             and mandate["mandate"] is None
             and best_searched.serendipity_value != 0.0
         )
+
+        # ---- SAFE-DREAM per-decision diagnostics (additive) ------------- #
+        # Final per-group top candidates (before selecting the single best):
+        # their scores drive diversity/entropy and their WM risk_hat drives
+        # risk-prediction metrics. Risk is predicted from the root state for
+        # each candidate's first action so it is comparable to chosen_risk.
+        final_candidates = [p for grp in beam.groups for p in grp if p.actions]
+        candidate_scores = [float(p.score) for p in final_candidates]
+        candidate_risk_predictions = [
+            self._predict_risk(state_np, p.actions[0]) for p in final_candidates
+        ]
+        chosen_risk_prediction = self._predict_risk(state_np, exec_action_np)
+
         metadata = {
             "lookahead": H,
             "beam_width": B,
@@ -478,5 +513,12 @@ class SDBSPlanner:
             "first_raw_action": best_searched.first_raw_action,
             "first_log_prob": best_searched.first_log_prob,
             "first_value": best_searched.first_value,
+            # SAFE-DREAM beam diagnostics (additive keys only).
+            "n_candidates_evaluated": int(n_candidates_evaluated),
+            "n_candidates_rejected_unsafe": int(n_candidates_rejected_unsafe),
+            "candidate_scores": candidate_scores,
+            "candidate_risk_predictions": candidate_risk_predictions,
+            "chosen_risk_prediction": chosen_risk_prediction,
+            "prediction_timestamp": int(info.get("timestep", 0)),
         }
         return best_action, best_searched, metadata

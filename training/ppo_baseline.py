@@ -22,6 +22,7 @@ from training.ppo import update_ppo
 from training.logger import Logger
 from training.wm_buffer import WorldModelBuffer
 from training.world_model_trainer import WorldModelTrainer
+from training.safe_dream_accumulator import EpisodeSafetyAccumulator
 from utils.progress_monitor import ProgressMonitor
 from rewards.vru_reward import ROUTE_PROGRESS
 
@@ -91,6 +92,7 @@ def train_baseline(config=None, mock=False, num_episodes=None, verbose=True,
             ep_components = {k: 0.0 for k in
                              ("progress", "vru_risk", "collision", "comfort", "rules")}
             route_completion = float(obs[ROUTE_PROGRESS])
+            safe_acc = EpisodeSafetyAccumulator(config)
             done = False
 
             # Fill the rollout buffer (may span several env episodes).
@@ -104,6 +106,7 @@ def train_baseline(config=None, mock=False, num_episodes=None, verbose=True,
                 buffer.store(obs, raw_action, reward, done, value, log_prob,
                              next_obs, risk_target, progress_target)
                 wm_buffer.add(obs, action, next_obs, risk_target, progress_target)
+                safe_acc.record_step(info, next_obs)
                 ep_return += reward
                 ep_collisions += int(bool(info.get("collision", False)))
                 ep_lane_departures += int(bool(info.get("lane_departure", False)))
@@ -170,6 +173,7 @@ def train_baseline(config=None, mock=False, num_episodes=None, verbose=True,
                 "lane_departures": ep_lane_departures,
                 "route_completion": route_completion,
             }
+            record.update(safe_acc.summarize())
             history.append(record)
             if logger is not None:
                 logger.log(episode, record)

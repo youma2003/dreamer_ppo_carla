@@ -24,6 +24,7 @@ from training.logger import Logger
 from training.wm_buffer import WorldModelBuffer
 from training.world_model_trainer import WorldModelTrainer
 from training.evaluator import Evaluator
+from training.safe_dream_accumulator import EpisodeSafetyAccumulator
 from utils.progress_monitor import ProgressMonitor
 from rewards.vru_reward import ROUTE_PROGRESS
 
@@ -152,19 +153,36 @@ def train(config=None, mock=False, num_episodes=None, verbose=True, log_dir=None
             ep_collisions = 0
             ep_lane_departures = 0
             route_completion = float(obs[ROUTE_PROGRESS])
+            safe_acc = EpisodeSafetyAccumulator(config)
+            unsafe_thr = getattr(config, "unsafe_score_threshold", -5.0)
             done = False
             info = {}
 
             # ---- collect a rollout (may span several env episodes) ---- #
             while not buffer.is_full():
                 state = torch.as_tensor(obs, dtype=torch.float32, device=device)
-                action_np, raw_action_np, log_prob, value, _scores, dreaming_used = \
+                action_np, raw_action_np, log_prob, value, scores, dreaming_used = \
                     _select_action(policy, world_model, wm_trainer, state,
                                    config, device)
                 if dreaming_used:
                     ep_stats["dreaming_steps"] += 1
 
                 next_obs, reward, done, info = env.step(action_np)
+
+                # SAFE-DREAM telemetry. Greedy dreaming's k imagined candidates
+                # are this variant's "counterfactuals": their scores drive
+                # coverage / diversity / rejection metrics (risk_hat isn't
+                # surfaced here, so risk-prediction fields stay 0 for dreamer).
+                safe_acc.record_step(info, next_obs)
+                if dreaming_used and scores:
+                    safe_acc.record_plan_meta({
+                        "n_candidates_evaluated": len(scores),
+                        "n_candidates_rejected_unsafe":
+                            sum(1 for sc in scores if sc < unsafe_thr),
+                        "candidate_scores": list(scores),
+                        "candidate_risk_predictions": [],
+                        "chosen_risk_prediction": None,
+                    })
                 risk_target = float(info.get("vru_risk", 0.0))
                 progress_target = float(info.get("progress", 0.0))
 
@@ -284,6 +302,7 @@ def train(config=None, mock=False, num_episodes=None, verbose=True, log_dir=None
                 "lane_departures": ep_lane_departures,
                 "route_completion": route_completion,
             }
+            record.update(safe_acc.summarize())
             record.update(eval_stats)
             history.append(record)
             if logger is not None:
@@ -422,6 +441,7 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
                 )
 
             safety_tracker.reset()
+            safe_acc = EpisodeSafetyAccumulator(config)
             ep_return = 0.0
             ep_collisions = 0
             ep_planning_steps = 0
@@ -447,14 +467,19 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
 
                     safety_tracker.step()
                     ep_latency_sum += meta.get("latency_ms", 0.0)
+                    # SAFE-DREAM: fold this decision's beam diagnostics in.
+                    safe_acc.record_plan_meta(meta)
                     # Lane-change accounting from the planner's mandate decision.
                     if meta.get("mandate") == "stay_in_lane":
                         safety_tracker.record_lane_change(
                             is_safe=False, blocked_by_mandate=True)
+                        # A blocked unsafe lane change is a disengagement-equivalent.
+                        safe_acc.record_disengagement()
                     elif abs(float(action_np[0])) > 0.3:
                         safety_tracker.record_lane_change(is_safe=True)
 
                     next_obs, reward, done, info = env.step(action_np)
+                    safe_acc.record_step(info, next_obs)
 
                     # Tier-3: accumulate per-step safety metrics.
                     for d, ttc in zip(info.get("vru_distance_list", []),
@@ -613,6 +638,7 @@ def train_sdbs(config=None, mock=False, num_episodes=None, verbose=True,
                 "r_rules": ep_reward_components.get("rules", 0.0),
             }
             record.update(safety_summary)
+            record.update(safe_acc.summarize())
             record["vru_collisions"] = max(ep_collisions,
                                            safety_summary["vru_collisions"])
             history.append(record)

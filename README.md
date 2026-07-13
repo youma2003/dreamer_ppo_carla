@@ -85,8 +85,50 @@ Before wiring a trained checkpoint into ANY external runtime/adapter
 ```bash
 python tests/test_mock.py                     # full mock pipeline
 python tests/test_sdbs.py                      # S-DBS core logic
+python tests/test_safe_dream_metrics.py        # SAFE-DREAM safety metrics
 python tests/test_integration_diagnostics.py   # integration guardrails
 python tests/test_tier1_safety.py
 python tests/test_tier2_generalization.py
 python tests/test_tier3_interpretability.py
 ```
+
+## SAFE-DREAM Safety Evaluation
+
+Based on Prof. Ben Yahia's **SAFE-DREAM** framework (July 2026). This module
+implements **Dimension 4 (Action Dreaming Quality)**, **Dimension 5 (Decision
+Quality)**, and a partial **Dimension 6 (Safety Assurance via
+logging/traceability)** — the dimensions genuinely applicable to a world-model +
+RL system that has no perception stack and no LLM reasoning layer.
+
+Implemented metrics:
+
+- **Decision Quality / Safety (§3.2):** Collision Rate, Near-Collision Rate,
+  Min/P5 TTC, Min Safety Distance, Safety-Envelope Violations, Disengagement
+  Rate, Traffic-Rule Compliance, Driving Comfort (jerk).
+- **Dreaming-specific KPIs (§4, dreamer/sdbs only):** Counterfactual Coverage,
+  Future Diversity, Unsafe-Maneuver Rejection Rate, Risk-Prediction Accuracy,
+  Hazard-Anticipation Horizon.
+
+**Explicitly out of scope (documented, not silently skipped):**
+
+- **Dimension 1 (Perception Quality)** — CARLA ground truth is used; there is no
+  perception stack in this repo.
+- **Dimension 2 (Semantic World Model)** — the world model predicts state
+  vectors, not semantic scene graphs.
+- **Dimension 3 (Reasoning Quality)** — no LLM/causal reasoning module.
+- **Hallucination Rate, Physical Realism, EU-CEM Traceability/Scenario
+  Coverage** — require a generative visual world model and a formal scenario
+  database; both are future work.
+
+Usage (reads the per-variant CSV logs produced by training):
+
+```bash
+python -m scripts.safe_dream_report \
+    baseline=logs/baseline.csv dreamer=logs/dreamer.csv sdbs=logs/sdbs.csv \
+    --plot logs/plots/safe_dream.png
+```
+
+**Important caveat:** `distance_per_episode_km` is an **estimate** (default
+`0.15` km/episode) because exact traveled distance isn't tracked yet. Collision
+Rate, Near-Collision Rate, and Disengagement Rate are therefore approximate
+until real odometry is logged; every other metric is exact.

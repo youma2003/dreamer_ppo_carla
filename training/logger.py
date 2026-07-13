@@ -36,6 +36,14 @@ class Logger:
         # --- periodic eval ---
         "eval_return", "eval_vru_collisions", "eval_near_misses",
         "eval_route_completion", "eval_lane_departures",
+        # --- SAFE-DREAM safety evaluation (additive; beam fields 0/NaN for
+        #     the baseline variant, which has no beam search) ---
+        "n_candidates_evaluated", "n_candidates_rejected_unsafe",
+        "candidate_score_mean", "candidate_score_std", "candidate_score_entropy",
+        "mean_risk_prediction", "chosen_risk_prediction",
+        "min_ttc_this_episode", "p5_ttc_this_episode",
+        "min_safety_distance_this_episode", "safety_envelope_violations",
+        "jerk_mean", "jerk_max", "disengagement_count",
     ]
 
     # Compact view for the console summary table.
